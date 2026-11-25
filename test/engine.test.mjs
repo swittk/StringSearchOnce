@@ -181,6 +181,15 @@ test('case-sensitive nomination preserves boundaries that lowercase NFC changes'
   assert.deepEqual(ids(await f.reader.search(f.options('aJ', { caseSensitive: true }))), []);
 });
 
+test('an in-flight search keeps its matching mode while opening the reader', async () => {
+  const f = fixture([doc('a', 'Desk')]);
+  const options = f.options('Desk', { caseSensitive: false });
+  const pending = f.reader.search(options);
+  options.caseSensitive = true;
+  assert.deepEqual(ids(await pending), ['a']);
+  assert.deepEqual(ids(await f.reader.search(options)), ['a']);
+});
+
 test('exact and prefix kind priority wins before lower tiers', async () => {
   const f = fixture();
   const result = await f.reader.search(f.options('café', { limit: 30 }));
@@ -483,13 +492,24 @@ test('aborted worker builds reject and close', async () => {
 });
 
 test('cancelling from a source getter stops worker batch preparation', async () => {
-  const controller = new AbortController();
-  let readLaterRow = false;
-  const input = [
-    { id: 'a', get names() { controller.abort(); return []; } },
-    { id: 'b', get names() { readLaterRow = true; return []; } },
-  ];
   const options = { generation: 'abort-fixture', kinds };
-  await assert.rejects(buildPostingGenerationInWorker(input, options, controller.signal), /POSTING_BUILD_CANCELLED/);
-  assert.equal(readLaterRow, false);
+  for (const cancelFrom of ['row', 'name']) {
+    const controller = new AbortController();
+    const laterReads = [];
+    const laterName = { kind: 'title', get text() { laterReads.push('name'); return 'lamp'; } };
+    const firstName = { kind: 'title', get text() { controller.abort(); return 'desk'; } };
+    const input = [
+      {
+        id: 'a',
+        get names() {
+          if (cancelFrom === 'name') return [firstName, laterName];
+          controller.abort();
+          return [laterName];
+        },
+      },
+      { id: 'b', get names() { laterReads.push('row'); return []; } },
+    ];
+    await assert.rejects(buildPostingGenerationInWorker(input, options, controller.signal), /POSTING_BUILD_CANCELLED/);
+    assert.deepEqual(laterReads, [], cancelFrom);
+  }
 });

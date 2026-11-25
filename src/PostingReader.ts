@@ -770,6 +770,7 @@ export class PostingReader {
     positions: Array<{ tier: number; ordinal: number }>;
   }> {
     const {
+      caseSensitive,
       limit = 10,
       batchSize = 20,
       maxSourceCandidates = 10000,
@@ -784,10 +785,10 @@ export class PostingReader {
     )
       throw new Error('POSTING_QUERY_LIMITS');
     const resultLimit = includeLookahead ? limit + 1 : limit;
-    const matchingPhrase = options.caseSensitive
+    const matchingPhrase = caseSensitive
       ? options.text.normalize('NFC').trim()
       : foldPostingText(options.text);
-    const lookupPhrase = options.caseSensitive ? lowercasePostingText(matchingPhrase) : matchingPhrase;
+    const lookupPhrase = caseSensitive ? lowercasePostingText(matchingPhrase) : matchingPhrase;
     const words = lookupPhrase.split(/\s+/u).filter(Boolean);
     const ordinarySingleCharacter = /^[^\p{S}]$/u.test(matchingPhrase);
     const result: PostingSearchResult<T> = {
@@ -804,8 +805,8 @@ export class PostingReader {
     if (words.length > 32) throw new Error('POSTING_QUERY_TOO_LONG');
     await this.open();
     const includeCaseSensitiveKeys =
-      options.caseSensitive && this.terms.at(-1)?.startsWith(caseSensitivePostingPrefix);
-    const matchingWords = options.caseSensitive ? matchingPhrase.split(/\s+/u) : words;
+      caseSensitive && this.terms.at(-1)?.startsWith(caseSensitivePostingPrefix);
+    const matchingWords = caseSensitive ? matchingPhrase.split(/\s+/u) : words;
     const tick = () => {
       if (++result.cursorSteps > maxCursorSteps) throw new Error('POSTING_CURSOR_LIMIT');
     };
@@ -824,7 +825,7 @@ export class PostingReader {
     const rankQuery: PostingRankQuery = {
       phrase: matchingPhrase,
       words: matchingWords,
-      caseSensitive: options.caseSensitive,
+      caseSensitive,
       prefixOnly: ordinarySingleCharacter,
       kindRanks: createPostingKindRanks(this.manifest.kinds),
     };
