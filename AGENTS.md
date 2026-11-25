@@ -1,0 +1,9 @@
+# Development
+
+- Use Node 22 from .nvmrc; run npm run check before submitting changes.
+- Keep the core generic and dependency-free at runtime. Use native binary pages.
+- Do not add database drivers, application-specific schemas, a queue, or a distributed lock to this package.
+- Preserve the format, ranking, result order and measured search performance unless a deliberate format change is reviewed.
+- Prefer direct loops and readable checks over extra passes, nested transformations and speculative validation.
+- Use generated, non-sensitive benchmark fixtures only.
+- Changes go through a feature branch and a PR into premaster. Do not merge or publish without owner approval.
