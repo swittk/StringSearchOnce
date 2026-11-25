@@ -1,0 +1,21 @@
+name: Check
+on:
+  pull_request:
+  push:
+    branches: [premaster]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: ['18.18.0', '20.5.0', '22']
+    env:
+      npm_config_engine_strict: 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run check
