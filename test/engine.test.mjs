@@ -224,6 +224,30 @@ test('signed keyset pages fill across rank tiers and reject changed scope, query
   await assert.rejects(other.reader.searchPage({ ...options, cursor: first }), /POSTING_CURSOR_INVALID/);
 });
 
+test('signed page lookahead respects the caller candidate budget', async () => {
+  const f = fixture([doc('a', 'Blue desk'), doc('b', 'Desk')]);
+  const options = f.options('blue desk', {
+    limit: 1, maxSourceCandidates: 1,
+    scopeKey: 'demo:catalog:visible', signingKey: 'synthetic-test-signing-key',
+  });
+  const page = await f.reader.searchPage(options);
+  assert.deepEqual(ids(page), ['a']);
+  assert.equal(page.sourceCandidates, 1);
+  assert.equal(page.nextCursor, undefined);
+  await assert.rejects(f.reader.searchPage({ ...options, limit: 2 }), /POSTING_QUERY_LIMITS/);
+
+  const fetched = [];
+  await assert.rejects(f.reader.searchPage({
+    ...options,
+    text: 'desk',
+    fetchSources: async requested => {
+      fetched.push(...requested);
+      return options.fetchSources(requested);
+    },
+  }), /POSTING_SOURCE_CANDIDATE_LIMIT/);
+  assert.deepEqual(fetched, ['b']);
+});
+
 test('rank/ID continuation need not refer to an object in the snapshot', async () => {
   const f = fixture();
   const result = await f.reader.searchAfterRank(f.options('café', { limit: 30 }), {

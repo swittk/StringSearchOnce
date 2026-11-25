@@ -664,7 +664,7 @@ export class PostingReader {
     }
     // One extra accepted row proves there really is another page. Never count a
     // denied row or a stale-name false positive as proof that more results exist.
-    const { result, positions } = await this.searchRun({ ...request, limit: limit + 1 }, after);
+    const { result, positions } = await this.searchRun(request, after, true);
     if (result.results.length <= limit) return result;
     const last = positions[limit - 1]!;
     const payload = Buffer.from(JSON.stringify([1, digest, last.tier, last.ordinal])).toString(
@@ -706,7 +706,8 @@ export class PostingReader {
   /** Find the ranked prefix of authorized matches, without fetching/sorting the entire candidate set. */
   private async searchRun<T>(
     options: PostingSearchOptions<T>,
-    after?: { tier: number; ordinal: number }
+    after?: { tier: number; ordinal: number },
+    includeLookahead = false
   ): Promise<{
     result: PostingSearchResult<T>;
     positions: Array<{ tier: number; ordinal: number }>;
@@ -725,6 +726,7 @@ export class PostingReader {
       limit > maxSourceCandidates
     )
       throw new Error('POSTING_QUERY_LIMITS');
+    const resultLimit = includeLookahead ? limit + 1 : limit;
     const folded = foldPostingText(options.text),
       words = folded.split(/\s+/u).filter(Boolean);
     const matchingPhrase = options.caseSensitive ? options.text.normalize('NFC').trim() : folded;
@@ -766,7 +768,7 @@ export class PostingReader {
       kindRanks: createPostingKindRanks(this.manifest.kinds),
     };
     for (const [tierNumber, tier] of tiers.entries()) {
-      if (result.results.length >= limit) break;
+      if (result.results.length >= resultLimit) break;
       if (after && tierNumber < after.tier) continue;
       let cursor: Cursor;
       if (tier.stage === 'exact') {
@@ -779,9 +781,9 @@ export class PostingReader {
         cursor = await this.intersection(Array.from(gramTerms, (term) => this.exact(term)), tick);
       }
       if (after && tierNumber === after.tier) await cursor.seek(after.ordinal + 1);
-      while (cursor.peek() !== Infinity && result.results.length < limit) {
+      while (cursor.peek() !== Infinity && result.results.length < resultLimit) {
         const candidates: number[] = [];
-        const size = Math.min(batchSize, limit - result.results.length);
+        const size = Math.min(batchSize, resultLimit - result.results.length);
         while (cursor.peek() !== Infinity && candidates.length < size) {
           tick();
           const ordinal = cursor.peek();
