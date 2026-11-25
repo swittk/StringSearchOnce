@@ -94,6 +94,35 @@ test('binary delta-varints and compressed pages round-trip, including sliced vie
   assert.throws(() => unpackPostingPage(packed, 1));
 });
 
+test('builder rejects empty kinds before emitting an unreadable manifest', () => {
+  assert.throws(
+    () => buildPostingGeneration([], { generation: 'fixture-1', kinds: [''] }),
+    /POSTING_BUILD_OPTIONS/
+  );
+});
+
+test('builder accounts for both lexicon page brackets at the inflation limit', async () => {
+  // The exact-name entry is first and its one posting uses byte 0 of page 0.
+  const entryOverhead = Buffer.byteLength(JSON.stringify(['n""|a', 1, [[0, 0, 1, 1, 0, 0]]]));
+  const kind = 'k'.repeat(262144 - 2 - entryOverhead);
+  const atLimit = fixture([{ id: 'a', names: [name(kind, 'a')] }], { kinds: [kind] });
+  await atLimit.reader.open();
+  const overLimit = kind + 'k';
+  assert.throws(
+    () => fixture([{ id: 'a', names: [name(overLimit, 'a')] }], { kinds: [overLimit] }),
+    /POSTING_LEXICON_ENTRY_TOO_LARGE/
+  );
+});
+
+test('reader accepts a full ID page with maximum-length JSON-escaped IDs', async () => {
+  const input = Array.from({ length: 4096 }, (_, i) => {
+    const suffix = i.toString(2).padStart(12, '0').replaceAll('0', '"').replaceAll('1', '\\');
+    return { id: '"'.repeat(116) + suffix, names: i === 0 ? [name('title', 'target')] : [] };
+  });
+  const f = fixture(input, { idsPerPage: 4096 });
+  assert.deepEqual(ids(await f.reader.search(f.options('target'))), [input[0].id]);
+});
+
 test('all rank tiers, Unicode, cross-field words and single-character coverage match an independent oracle', async () => {
   const f = fixture();
   for (const text of ['café','cafe\u0301','café tab','fé','ceramic blue','ไม้','โต๊ะ น้ำเงิน','🪴','c','a','absent','']) {
@@ -105,6 +134,25 @@ test('all rank tiers, Unicode, cross-field words and single-character coverage m
   const sensitive = await f.reader.search(f.options('Café', { caseSensitive: true }));
   assert.deepEqual(ids(sensitive), oracle(documents, 'Café', { caseSensitive: true }));
   assert.deepEqual(ids(await f.reader.search(f.options('CAFÉ', { caseSensitive: true }))), []);
+});
+
+test('Greek sigma is nominated consistently at exact, prefix and substring positions', async () => {
+  const f = fixture([
+    doc('a', 'ΟΣ'), doc('b', 'ΟΣΑ'), doc('c', 'ΧΟΣΑ'), doc('d', 'οσα'),
+  ]);
+  for (const query of ['ΟΣ', 'ος', 'οσ']) {
+    assert.deepEqual(ids(await f.reader.search(f.options(query))), ['a', 'b', 'd', 'c']);
+  }
+  const sensitive = await f.reader.search(f.options('ΟΣ', { caseSensitive: true }));
+  assert.deepEqual(ids(sensitive), ['a', 'b', 'c']);
+  assert.deepEqual(sensitive.results.map(hit => hit.stage), ['exact', 'prefix', 'substring']);
+});
+
+test('case-sensitive coverage counts NFC code points before lowercasing', async () => {
+  const f = fixture([doc('a', 'İ'), doc('b', 'İZ'), doc('c', 'AİZ')]);
+  const result = await f.reader.search(f.options('I\u0307', { caseSensitive: true }));
+  assert.equal(result.coverage, 'prefix-only');
+  assert.deepEqual(ids(result), ['a', 'b']);
 });
 
 test('exact and prefix kind priority wins before lower tiers', async () => {
@@ -136,6 +184,18 @@ test('live source verification removes stale, deleted, and denied nominations be
   const result = await f.reader.search(options);
   assert.deepEqual(ids(result), ['j','d','e']);
   assert(result.sourceCandidates >= 5);
+});
+
+test('source verification distinguishes falsy fetched rows from missing and denied rows', async () => {
+  const f = fixture([doc('0', 'target'), doc('1', 'target'), doc('2', 'target'), doc('3', 'target')]);
+  const getId = value => value === undefined ? '1' : String(value);
+  const result = await f.reader.search(f.options('target', {
+    fetchSources: async () => [0, undefined, 2],
+    getId,
+    getNames: value => f.rows.get(getId(value)).names,
+    filterCandidates: async rows => rows.filter(value => value !== 2),
+  }));
+  assert.deepEqual(result.results.map(hit => hit.object), [0, undefined]);
 });
 
 test('signed keyset pages fill across rank tiers and reject changed scope, query, and generation', async () => {
@@ -193,8 +253,10 @@ test('broad repeated terms retrieve only a bounded ranked prefix and reuse warm 
   assert.equal(ids(await f.reader.search(f.options('generic lamp')))[0], input[1].id);
 });
 
-test('worker builds identical binary pages without blocking the calling event loop', async () => {
+test('worker builds identical binary pages while the calling event loop progresses', async () => {
   const input = Array.from({ length: 600 }, (_, i) => doc('r'+i, 'Blue desk '+i, 'Desk'));
+  input[256].names = [];
+  input[257].names = [name('title', 'Blue desk 257')];
   const options = { generation: 'worker-fixture', kinds };
   const direct = buildPostingGeneration(input, options);
   let ticks = 0;
@@ -208,6 +270,39 @@ test('worker builds identical binary pages without blocking the calling event lo
   } finally { clearInterval(timer); }
 });
 
+test('worker builds use selected fields on typed documents, names and options', async () => {
+  class Name {
+    get kind() { return 'title'; }
+    get text() { return 'desk'; }
+  }
+  class Document {
+    get id() { return 'a'; }
+    get names() { return [new Name()]; }
+  }
+  class Options {
+    get generation() { return 'worker-fixture'; }
+    get kinds() { return kinds; }
+  }
+  const input = [new Document()];
+  const options = new Options();
+  assert.deepEqual(await buildPostingGenerationInWorker(input, options), buildPostingGeneration(input, options));
+});
+
+test('worker ignores unrelated fields after the first batch', async () => {
+  const input = Array.from({ length: 257 }, (_, i) => doc(String(i), 'desk'));
+  input[256].extra = () => {};
+  const options = { generation: 'worker-fixture', kinds };
+  assert.deepEqual(await buildPostingGenerationInWorker(input, options), buildPostingGeneration(input, options));
+});
+
+test('worker rejects when preparing an acknowledged batch fails', async () => {
+  const input = Array.from({ length: 256 }, (_, i) => doc(String(i), 'desk'));
+  const failure = new Error('source unavailable');
+  input.push({ id: '256', get names() { throw failure; } });
+  const options = { generation: 'worker-fixture', kinds };
+  await assert.rejects(buildPostingGenerationInWorker(input, options), error => error === failure);
+});
+
 test('CommonJS consumer includes a working compiled worker', async () => {
   const require = createRequire(import.meta.url);
   const cjs = require('stringsearchonce');
@@ -218,6 +313,7 @@ test('CommonJS consumer includes a working compiled worker', async () => {
 
 test('aborted worker builds reject and close', async () => {
   const controller = new AbortController();
+  controller.signal.addEventListener('abort', event => event.stopImmediatePropagation());
   const pending = buildPostingGenerationInWorker(documents, { generation: 'abort-fixture', kinds }, controller.signal);
   controller.abort();
   await assert.rejects(pending, /POSTING_BUILD_CANCELLED/);

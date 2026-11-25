@@ -34,7 +34,7 @@ export function buildPostingGeneration(
   if (!generation || generation.length > 160)
     throw new Error('POSTING_BUILD_OPTIONS');
   const indexedKinds = new Set(kinds);
-  if (!kinds.length || indexedKinds.size !== kinds.length)
+  if (!kinds.length || indexedKinds.size !== kinds.length || indexedKinds.has(''))
     throw new Error('POSTING_BUILD_OPTIONS');
   if (!Number.isSafeInteger(chunkIds) || chunkIds < 1 || chunkIds > 4096)
     throw new Error('POSTING_BUILD_LIMITS');
@@ -101,7 +101,8 @@ export function buildPostingGeneration(
     jsonBytes = 2;
   for (const entry of entries) {
     const size = Buffer.byteLength(JSON.stringify(entry)) + 1;
-    if (size > 262144) throw new Error('POSTING_LEXICON_ENTRY_TOO_LARGE');
+    // Size includes one separator byte. A singleton page needs two brackets.
+    if (size + 1 > 262144) throw new Error('POSTING_LEXICON_ENTRY_TOO_LARGE');
     if (pageEntries.length && jsonBytes + size > 65536) {
       lexiconPages.push(packPostingJson(pageEntries));
       pageEntries = [];

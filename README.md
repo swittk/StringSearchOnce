@@ -53,11 +53,12 @@ console.log(result.results);
 
 The same API is available from CommonJS. For a large build, use
 `buildPostingGenerationInWorker(rows, options, signal?)` instead of the
-synchronous builder. The worker is included in the package. It processes input
-in acknowledged batches so large input clones and index construction do not
-block the calling event loop. When bundling the library into a standalone
-application, retain the matching ESM or CJS packaged worker file beside the compiled entrypoint
-or keep the library external.
+synchronous builder. The worker is included in the package and constructs the
+index off the calling thread. The calling thread copies and serializes the
+selected fields in acknowledged batches of up to 256 rows. Large name values
+can still make a batch expensive to send. When bundling the library into a
+standalone application, retain the matching ESM or CJS packaged worker file
+beside the compiled entrypoint or keep the library external.
 
 ## Index and storage
 
@@ -86,10 +87,10 @@ publish replacement generations or combine readers with its own live
 changes; the library does not provide a mutable index or background
 publication lifecycle.
 
-Source IDs are unique nonempty printable ASCII strings of at most 128
-characters. Search terms are Unicode text. The caller supplies the ordered
-name kinds; the index folds case with NFC normalization, retaining accents
-and combining marks. Search uses Unicode code points, not raw UTF-16 units.
+Source IDs are unique strings of 1 to 128 ASCII characters from `0x21`
+through `0x7E`. Search terms are Unicode text. The caller supplies the ordered
+nonempty name kinds. The index folds case with NFC normalization, retaining
+accents and combining marks. Search uses Unicode code points.
 
 ## Search order and eligibility
 

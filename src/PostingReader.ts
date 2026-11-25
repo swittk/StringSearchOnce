@@ -461,7 +461,10 @@ export class PostingReader {
         this.counters.pagesRead += pages.size;
         const value = pages.get(page);
         if (!value) throw new Error('POSTING_PAGE_MISSING:' + kind + ':' + page);
-        const decoded = unpackPostingPage(value, kind === 'ids' ? 1048576 : 131072);
+        // A 128-character ID can double through JSON escaping. Count quotes,
+        // separators and array brackets for a full page.
+        const maxBytes = kind === 'ids' ? this.manifest.idsPerPage * (128 * 2 + 3) + 1 : 131072;
+        const decoded = unpackPostingPage(value, maxBytes);
         this.counters.pageDecodes++;
         this.pageCache.put(key, decoded, decoded.byteLength);
         return decoded;
@@ -724,8 +727,8 @@ export class PostingReader {
       throw new Error('POSTING_QUERY_LIMITS');
     const folded = foldPostingText(options.text),
       words = folded.split(/\s+/u).filter(Boolean);
-    const ordinarySingleCharacter =
-      words.length === 1 && Array.from(words[0]!).length === 1 && !/^\p{S}$/u.test(words[0]!);
+    const matchingPhrase = options.caseSensitive ? options.text.normalize('NFC').trim() : folded;
+    const ordinarySingleCharacter = /^[^\p{S}]$/u.test(matchingPhrase);
     const result: PostingSearchResult<T> = {
       generation: this.manifest.generation,
       coverage: ordinarySingleCharacter ? 'prefix-only' : 'substring',
@@ -739,7 +742,6 @@ export class PostingReader {
     if (!words.length) return { result, positions };
     if (options.text.length > 512 || words.length > 32) throw new Error('POSTING_QUERY_TOO_LONG');
     await this.open();
-    const matchingPhrase = options.caseSensitive ? options.text.normalize('NFC').trim() : folded;
     const matchingWords = options.caseSensitive ? matchingPhrase.split(/\s+/u) : words;
     const tick = () => {
       if (++result.cursorSteps > maxCursorSteps) throw new Error('POSTING_CURSOR_LIMIT');
@@ -810,9 +812,13 @@ export class PostingReader {
           for (const [index, ordinal] of missing.entries()) {
             const id = ids[index]!;
             const object = fetchedById.get(id);
-            sourceRows.set(ordinal, object && allowed.has(id)
-              ? { object, rank: findBestPostingRank(options.getNames(object), rankQuery) }
-              : null);
+            if ((object !== undefined || fetchedById.has(id)) && allowed.has(id)) {
+              const row = object as T;
+              const rank = findBestPostingRank(options.getNames(row), rankQuery);
+              sourceRows.set(ordinal, { object: row, rank });
+            } else {
+              sourceRows.set(ordinal, null);
+            }
           }
         }
         for (const ordinal of candidates) {

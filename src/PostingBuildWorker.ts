@@ -1,3 +1,4 @@
+import { addAbortListener } from 'node:events';
 import { Worker } from 'node:worker_threads';
 import { extname, join } from 'node:path';
 import type { PostingDocument, BuiltPostingGeneration } from './postingFormat';
@@ -14,24 +15,25 @@ export async function buildPostingGenerationInWorker(
 ): Promise<BuiltPostingGeneration> {
   if (signal?.aborted) throw new Error('POSTING_BUILD_CANCELLED');
   const workerFile = join(__dirname, 'stringSearchBuilderWorker' + extname(__filename));
+  const { generation, kinds, chunkIds, pageBytes, idsPerPage } = options;
   return new Promise<BuiltPostingGeneration>((resolve, reject) => {
     const worker = new Worker(workerFile, {
-      workerData: { options },
+      workerData: { options: { generation, kinds: [...kinds], chunkIds, pageBytes, idsPerPage } },
       resourceLimits: { maxOldGenerationSizeMb: 1536 },
     });
     let settled = false;
-    const finish = (error?: Error, value?: BuiltPostingGeneration) => {
+    const finish = (error: unknown, value?: BuiltPostingGeneration) => {
       if (settled) return;
       settled = true;
-      signal?.removeEventListener('abort', abort);
-      if (error) reject(error);
-      else resolve(value!);
+      abortSubscription?.[Symbol.dispose]();
+      if (value === undefined) reject(error);
+      else resolve(value);
     };
     const abort = () => {
       void worker.terminate();
       finish(new Error('POSTING_BUILD_CANCELLED'));
     };
-    signal?.addEventListener('abort', abort, { once: true });
+    const abortSubscription = signal && addAbortListener(signal, abort);
     let index = 0;
     worker.on(
       'message',
@@ -43,13 +45,31 @@ export async function buildPostingGenerationInWorker(
       }) => {
         if (settled) return;
         if (reply.type === 'ready' || reply.type === 'ack') {
-          // Only 256 small source records are cloned in any event-loop turn;
-          // Worker acknowledgements provide backpressure without timers.
-          if (index < documents.length) {
-            const next = documents.slice(index, index + 256);
-            index += next.length;
-            worker.postMessage({ type: 'rows', documents: next });
-          } else worker.postMessage({ type: 'build' });
+          try {
+            if (index >= documents.length) {
+              worker.postMessage({ type: 'build' });
+              return;
+            }
+            // Send each ID followed by its kind/text pairs. Flat arrays keep
+            // structured cloning cheap and acknowledgements pace the batches.
+            const fields: string[] = [];
+            const nameCounts: number[] = [];
+            const end = Math.min(index + 256, documents.length);
+            for (; index < end; index++) {
+              const { id, names } = documents[index]!;
+              fields.push(id);
+              let count = 0;
+              for (const { kind, text } of names) {
+                fields.push(kind, text);
+                count++;
+              }
+              nameCounts.push(count);
+            }
+            worker.postMessage({ type: 'rows', fields, nameCounts });
+          } catch (error) {
+            finish(error);
+            void worker.terminate();
+          }
           return;
         }
         if (reply.type === 'result' && reply.ok && reply.built) finish(undefined, reply.built);

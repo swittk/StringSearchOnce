@@ -39,7 +39,10 @@ export type BuiltPostingGeneration = {
 
 /** Case folding retains Unicode combining marks and accents. */
 export function foldPostingText(text: string): string {
-  return text.normalize('NFC').toLowerCase().normalize('NFC').trim();
+  // Lowercasing capital sigma depends on word position; search keys use one form.
+  const lower = text.normalize('NFC').toLowerCase();
+  const folded = lower.includes('ς') ? lower.replaceAll('ς', 'σ') : lower;
+  return folded.normalize('NFC').trim();
 }
 /** Bytewise ASCII object-ID order; never use language collation for posting ordinals. */
 export function comparePostingIds(a: string, b: string): number {

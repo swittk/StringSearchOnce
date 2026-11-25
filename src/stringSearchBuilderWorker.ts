@@ -1,19 +1,28 @@
 import { parentPort, workerData } from 'node:worker_threads';
 import { buildPostingGeneration, type BuildPostingOptions } from './buildPostingGeneration';
-import type { PostingDocument } from './postingFormat';
+import type { PostingDocument, PostingName } from './postingFormat';
 
-/** Batch-acknowledged input keeps large JS structured clones off the main loop. */
+/** Batch acknowledgements limit how many rows the caller sends at once. */
 type Request = {
   options: BuildPostingOptions;
 };
-type BatchMessage = { type: 'rows'; documents: PostingDocument[] };
+type BatchMessage = { type: 'rows'; fields: string[]; nameCounts: number[] };
 type BuildMessage = { type: 'build' };
 
 const documents: PostingDocument[] = [];
 const input = workerData as Request;
 parentPort?.on('message', (message: BatchMessage | BuildMessage) => {
   if (message.type === 'rows') {
-    documents.push(...message.documents);
+    const { fields, nameCounts } = message;
+    let offset = 0;
+    for (const count of nameCounts) {
+      const id = fields[offset++]!;
+      const names: PostingName[] = [];
+      for (let i = 0; i < count; i++) {
+        names.push({ kind: fields[offset++]!, text: fields[offset++]! });
+      }
+      documents.push({ id, names });
+    }
     parentPort?.postMessage({ type: 'ack' });
     return;
   }
