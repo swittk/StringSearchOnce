@@ -423,6 +423,206 @@ test('a failed ID page request can be retried', async () => {
   assert.equal(idReads, 2);
 });
 
+test('ID enumeration batches cold reads and reuses the reader cache without opening the lexicon', async () => {
+  const documents = Array.from({ length: 21 }, (_, i) => doc(String(i).padStart(2, '0'), 'Desk'));
+  const { reader, reads } = fixture([...documents].reverse(), { idsPerPage: 2 });
+  const first = reader.idBatches();
+  assert.deepEqual(reads, []);
+  assert.deepEqual((await first.next()).value, ['00', '01']);
+  await first.return();
+  assert.deepEqual(reads, [{ kind: 'ids', pages: [0, 1, 2, 3, 4, 5, 6, 7] }]);
+
+  const actual = [];
+  for await (const batch of reader.idBatches()) actual.push(...batch);
+  assert.deepEqual(actual, documents.map(row => row.id));
+  assert.deepEqual(reads, [
+    { kind: 'ids', pages: [0, 1, 2, 3, 4, 5, 6, 7] },
+    { kind: 'ids', pages: [8, 9, 10] },
+  ]);
+  const empty = fixture([]);
+  assert.equal((await empty.reader.idBatches().next()).done, true);
+  assert.deepEqual(empty.reads, []);
+});
+
+test('composite keyset pages match the exhaustive order across overlapping current streams', async () => {
+  const templates = [
+    ['Desk', '', 'exact', 'title'],
+    ['Cabinet', 'Desk', 'exact', 'alias'],
+    ['Desk lamp', '', 'prefix', 'title'],
+    ['Cabinet', 'Desk chair', 'prefix', 'alias'],
+    ['Cedar desk', '', 'word-prefix', 'all'],
+    ['Cedar side-desk', '', 'substring', 'all'],
+  ];
+  const hits = Array.from({ length: 91 }, (_, i) => {
+    const [title, alias, stage, kind] = templates[i % templates.length];
+    return { object: doc(String(i).padStart(3, '0'), title, alias), stage, kind };
+  });
+  const current = hits.map(hit => hit.object);
+  // One current name is stale in both indexes, one row is stale in the source,
+  // and other nominations are missing, denied or removed by the extra filter.
+  const indexed = [...current];
+  indexed[24] = doc('024', 'Shelf');
+  current[25] = doc('025', 'Shelf');
+  const denied = new Set(['002', '033', '061']);
+  const filtered = new Set(['007', '041', '071']);
+  const allowed = new Map(current.filter(row => row.id !== '022' && !denied.has(row.id)).map(row => [row.id, row]));
+  const eligible = current.filter(row => allowed.has(row.id) && !filtered.has(row.id));
+  const expected = oracle(eligible, 'desk');
+  const base = fixture(indexed.slice(1, 61), { generation: 'base' });
+  const delta = fixture(indexed.slice(18, 81), { generation: 'delta' });
+  const readers = [base.reader, delta.reader];
+  const rank = (stage, kind) => templates.findIndex(entry => entry[2] === stage && entry[3] === kind);
+  const liveCalls = [];
+  const live = hits.filter(({ object }, index) =>
+    (index === 0 || index >= 20) && allowed.get(object.id) === object && !filtered.has(object.id));
+  live.sort((a, b) => rank(a.stage, a.kind) - rank(b.stage, b.kind) || (a.object.id < b.object.id ? -1 : 1));
+  const options = base.options('desk', {
+    fetchSources: async ids => [...ids].reverse().flatMap(id => allowed.has(id) ? [allowed.get(id)] : []),
+    filterCandidates: async rows => rows.filter(row => !filtered.has(row.id)),
+    scopeKey: 'catalog:member:revision-1',
+    signingKey: 'example-server-signing-key',
+    readLive: async (after, limit) => {
+      liveCalls.push({ after, limit });
+      const boundary = after ? rank(after.stage, after.kind) : -1;
+      return live.filter(hit => {
+        const tier = rank(hit.stage, hit.kind);
+        return tier > boundary || (tier === boundary && hit.object.id > after.id);
+      }).slice(0, limit).map(hit => ({ ...hit, object: { ...hit.object, viaLive: true } }));
+    },
+  });
+
+  const whole = fixture(eligible, { generation: 'whole' });
+  const single = await whole.reader.search(whole.options('desk', { limit: expected.length }));
+  assert.deepEqual(ids(single), expected);
+  for (const limit of [1, 7, 29, expected.length, 100]) {
+    const actual = [];
+    let cursor;
+    do {
+      const page = await PostingReader.searchCompositePage(readers, { ...options, cursor, limit });
+      assert.equal(liveCalls.at(-1).limit, limit + 1);
+      assert.equal(page.coverage, 'substring');
+      if (page.nextCursor) assert.equal(page.results.length, limit);
+      actual.push(...page.results);
+      assert(actual.length <= expected.length);
+      cursor = page.nextCursor;
+    } while (cursor);
+    assert.deepEqual(actual.map(hit => hit.object.id), expected);
+    assert.deepEqual(
+      actual.map(hit => [hit.object.id, hit.stage, hit.kind]),
+      single.results.map(hit => [hit.object.id, hit.stage, hit.kind])
+    );
+    assert.equal(actual[0].object.viaLive, true);
+    assert.equal(actual.find(hit => hit.object.id === '024').object.viaLive, true);
+    assert.equal(actual.find(hit => hit.object.id === '030').object.viaLive, undefined);
+  }
+  // In particular, the first boundary ID exists in neither immutable reader.
+  const first = await PostingReader.searchCompositePage(readers, { ...options, limit: 1 });
+  assert.deepEqual(ids(first), ['000']);
+  const cursor = first.nextCursor;
+  assert(cursor);
+  const changedDelta = fixture(indexed.slice(18, 81), { generation: 'delta-next' });
+  const reads = base.reads.length + delta.reads.length;
+  const calls = liveCalls.length;
+  for (const [active, changes] of [
+    [readers, { scopeKey: 'catalog:member:revision-2' }],
+    [readers, { signingKey: 'another-server-signing-key' }],
+    [readers, { text: 'Desk' }],
+    [readers, { caseSensitive: true }],
+    [readers, { readLive: undefined }],
+    [readers, { cursor: cursor.replace(/\..+$/, '.bad') }],
+    [[delta.reader, base.reader], {}],
+    [[base.reader, changedDelta.reader], {}],
+  ]) {
+    await assert.rejects(PostingReader.searchCompositePage(active, { ...options, cursor, ...changes }), /POSTING_CURSOR_INVALID/);
+  }
+  assert.equal(base.reads.length + delta.reads.length, reads);
+  assert.deepEqual(changedDelta.reads, []);
+  assert.equal(liveCalls.length, calls);
+});
+
+test('fully overlapping streams load only a bounded ranked prefix and honor lookahead budgets', async () => {
+  const documents = Array.from({ length: 400 }, (_, i) => doc(String(i).padStart(4, '0'), 'Desk'));
+  const a = fixture(documents, { generation: 'a' });
+  const b = fixture(documents, { generation: 'b' });
+  const options = a.options('Desk', { limit: 5, scopeKey: 'catalog', signingKey: 'example-server-signing-key' });
+  const page = await PostingReader.searchCompositePage([a.reader, b.reader], {
+    ...options,
+    maxSourceCandidates: 6,
+  });
+  assert.deepEqual(ids(page), documents.slice(0, 5).map(row => row.id));
+  assert(page.nextCursor);
+  assert.equal(page.sourceCandidates, 12);
+  assert.equal(page.sourceReads, 2);
+  for (const { reads } of [a, b]) {
+    assert.deepEqual(reads.filter(read => read.kind === 'ids').flatMap(read => read.pages), [0]);
+    assert.equal(reads.filter(read => read.kind === 'postings').flatMap(read => read.pages).length, 1);
+  }
+  await assert.rejects(
+    PostingReader.searchCompositePage([a.reader, b.reader], { ...options, maxSourceCandidates: 5 }),
+    /POSTING_SOURCE_CANDIDATE_LIMIT/
+  );
+  const short = fixture(documents.slice(0, 5), { generation: 'short' });
+  const exhausted = await PostingReader.searchCompositePage([short.reader], { ...options, maxSourceCandidates: 5 });
+  assert.deepEqual(ids(exhausted), ids(page));
+  assert.equal(exhausted.nextCursor, undefined);
+});
+
+test('composite failure waits for active source reads to settle', async () => {
+  const { reader, options, rows } = fixture([doc('01', 'Desk')]);
+  let started, finish;
+  const reading = new Promise(resolve => { started = resolve; });
+  const release = new Promise(resolve => { finish = resolve; });
+  const search = PostingReader.searchCompositePage([reader], options('desk', {
+    scopeKey: 'catalog',
+    signingKey: 'example-server-signing-key',
+    fetchSources: async ids => {
+      started();
+      await release;
+      return ids.map(id => rows.get(id));
+    },
+    readLive: async () => {
+      await reading;
+      throw new Error('live source failed');
+    },
+  }));
+  let settled = false;
+  const rejected = assert.rejects(search, /live source failed/).then(() => { settled = true; });
+  await reading;
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(settled, false);
+  } finally {
+    finish();
+  }
+  await rejected;
+});
+
+test('a current name edit between stream reads cannot duplicate an ID within a page', async () => {
+  const { reader, options, rows } = fixture([
+    doc('01', 'Desk'), doc('02', 'Cedar desk'), doc('03', 'Desk mat'),
+  ]);
+  let finishRead;
+  const observed = new Promise(resolve => { finishRead = resolve; });
+  const page = await PostingReader.searchCompositePage([reader], options('desk', {
+    limit: 3,
+    scopeKey: 'catalog',
+    signingKey: 'example-server-signing-key',
+    fetchSources: async ids => {
+      const result = ids.map(id => rows.get(id));
+      if (ids.includes('01')) finishRead();
+      return result;
+    },
+    readLive: async () => {
+      await observed;
+      const updated = doc('01', 'Maple desk');
+      rows.set(updated.id, updated);
+      return [{ object: updated, stage: 'word-prefix', kind: 'all' }];
+    },
+  }));
+  assert.deepEqual(ids(page), ['01', '03', '02']);
+  assert.equal(page.nextCursor, undefined);
+});
+
 test('worker builds identical binary pages while the calling event loop progresses', async () => {
   const input = Array.from({ length: 600 }, (_, i) => doc('r'+i, 'Blue desk '+i, 'Desk'));
   input[256].names = [];

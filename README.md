@@ -133,6 +133,34 @@ such edits, include a source revision in `scopeKey` and start a new traversal
 when the revision changes. `searchAfterRank` continues
 after a rank and source-ID boundary for applications combining ranked streams.
 
+## Multiple generations
+
+Use `reader.idBatches()` to enumerate a generation's IDs in ascending order
+using only ID pages. Batches are readonly.
+
+```ts
+for await (const ids of deltaReader.idBatches())
+  for (const id of ids) affectedIds.add(id);
+
+const page = await PostingReader.searchCompositePage([baseReader, deltaReader], {
+  text, fetchSources, getId, getNames, scopeKey, signingKey, cursor,
+  readLive: (after, limit) => findCurrentMatchesAfter(after, limit),
+});
+```
+
+All readers must use the same ordered kinds. The optional live callback
+returns a bounded prefix of distinct, eligible matches in the same rank/ID
+order, strictly after the supplied boundary. Use the same current-record,
+name ranking and access policies for every stream. Each page keeps the first
+match per ID in rank order. Ties keep the first reader's result, with live
+results last. The page reads at most one prefix of `limit + 1` hits per stream.
+Reader work limits apply to each reader. Bound live work in `readLive`.
+
+Pass `nextCursor` to continue with the same ordered generations, query and
+scope. Live edits can move a match across the cursor. Include a live revision
+in `scopeKey` to restart traversal on such edits. The caller owns live
+nomination, source reads and publication.
+
 The reader has explicit limits for cache size, lexicon size, candidate reads,
 and cursor work. Exceeding a limit throws rather than returning silently
 truncated results. Format 0 is pre-release; do not assume compatibility with
