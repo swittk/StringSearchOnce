@@ -746,6 +746,7 @@ export class PostingReader {
     const tier = postingTierRank(last, createPostingKindRanks(this.manifest.kinds));
     if (tier === undefined || !/^[\x21-\x7e]{1,128}$/.test(last.id))
       throw new Error('POSTING_RANK_CURSOR_INVALID');
+    if (!options.text.trim()) return (await this.searchRun(options)).result;
     await this.open();
     // Search the sorted ordinal->ID mapping. The continuation object may have
     // been inserted after the frozen snapshot, so equality is not required.

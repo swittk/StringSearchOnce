@@ -37,7 +37,12 @@ parentPort?.on('message', (message: BatchMessage | BuildMessage) => {
   }
   try {
     const built = buildPostingGeneration(documents, input.options);
-    parentPort?.postMessage({ type: 'result', ok: true, built });
+    const buffers: ArrayBuffer[] = [];
+    // Every packed page owns its buffer, and the worker is done with the pages.
+    for (const pages of built.pages.values()) {
+      for (const page of pages) buffers.push(page.buffer as ArrayBuffer);
+    }
+    parentPort?.postMessage({ type: 'result', ok: true, built }, buffers);
   } catch (error) {
     parentPort?.postMessage({
       type: 'result',

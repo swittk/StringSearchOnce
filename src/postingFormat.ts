@@ -38,7 +38,7 @@ export type BuiltPostingGeneration = {
   pages: ReadonlyMap<PostingPageKind, readonly PostingBytes[]>;
 };
 
-/** Case folding retains Unicode combining marks and accents. */
+/** Lowercase NFC text, normalize final sigma, and retain accents and combining marks. */
 export function foldPostingText(text: string): string {
   return lowercasePostingText(text.normalize('NFC')).normalize('NFC').trim();
 }
@@ -107,7 +107,7 @@ export function packPostingPage(bytes: Uint8Array): PostingBytes {
 }
 /** The reader calls this on a page-cache miss, not once per query. */
 export function unpackPostingPage(value: PostingBytes, maxBytes: number): Uint8Array {
-  if (!(value instanceof Uint8Array) || value.byteLength > maxBytes * 2)
+  if (!(value instanceof Uint8Array) || value.byteLength > Math.max(3, maxBytes * 2))
     throw new Error('POSTING_PAGE_INVALID');
   return new Uint8Array(inflateRawSync(value, { maxOutputLength: maxBytes }));
 }

@@ -94,6 +94,11 @@ test('binary delta-varints and compressed pages round-trip, including sliced vie
   assert.throws(() => unpackPostingPage(packed, 1));
 });
 
+test('a packed one-byte page fits a one-byte output limit', () => {
+  const byte = Uint8Array.of(0);
+  assert.deepEqual(unpackPostingPage(packPostingPage(byte), 1), byte);
+});
+
 test('builder rejects empty kinds before emitting an unreadable manifest', () => {
   assert.throws(
     () => buildPostingGeneration([], { generation: 'fixture-1', kinds: [''] }),
@@ -340,6 +345,17 @@ test('query entrypoints reject oversized blanks before reading index pages', asy
   );
   assert.deepEqual(ids(await f.reader.search(f.options(' \t '))), []);
   assert.deepEqual(f.reads, []);
+});
+
+test('rank continuation for a blank query needs no storage', async () => {
+  const f = fixture();
+  const reader = new PostingReader(f.built.manifest, {
+    async readPages() { throw new Error('store unavailable'); },
+  });
+  const options = f.options(' \t ');
+  const expected = await reader.search(options);
+  const continued = await reader.searchAfterRank(options, { stage: 'exact', kind: 'title', id: 'a' });
+  assert.deepEqual(continued, expected);
 });
 
 test('prefix term limits accept an exact fit and reject the first excess', async () => {

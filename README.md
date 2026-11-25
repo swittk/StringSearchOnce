@@ -96,9 +96,12 @@ changes; the library does not provide a mutable index or background
 publication lifecycle.
 
 Source IDs are unique strings of 1 to 128 ASCII characters from `0x21`
-through `0x7E`. Search terms are Unicode text. The caller supplies the ordered
-nonempty name kinds. The index folds case with NFC normalization, retaining
-accents and combining marks. Search uses Unicode code points.
+through `0x7E`. The caller supplies the ordered nonempty name kinds. Default
+matching lowercases NFC text and maps Greek final sigma (`ς`) to `σ`, retaining
+accents and combining marks. `STRASSE` and `Straße` have different lookup keys.
+Search uses Unicode code points. Build and read a generation with the same
+Node.js Unicode data version (`process.versions.unicode`). Rebuild the
+generation when changing Unicode versions.
 
 ## Search order and eligibility
 
@@ -106,14 +109,15 @@ The reader ranks exact names by kind, then whole-name prefixes by kind, then
 all-word token-prefix matches, then interior substring matches. Within a tier,
 source IDs sort in bytewise order. Words can match different names on the same
 record. A query with one ordinary code point has prefix-only coverage.
-The reader counts code points in the trimmed query after case folding by
-default, or after NFC normalization alone in `caseSensitive` mode. For
-example, `İ` can use substring coverage by default because it folds to two
+The reader counts code points in the trimmed query after lowercasing and
+normalization by default, or after NFC normalization alone in `caseSensitive`
+mode. For example, `İ` can use substring coverage because it lowercases to two
 code points. Standalone symbols can also use substring coverage. Queries
 containing only multiple ordinary one-character words are not supported.
 
 The fetch callback must enforce the caller's access rules and current source
-filters. Deleted, denied, and stale-name candidates are excluded before the
+filters and return at most one current record per requested ID. Deleted,
+denied, and stale-name candidates are excluded before the
 limit; the reader continues to later candidates when needed. Optional
 `filterCandidates` can perform additional eligibility checks.
 A changed name absent from the built snapshot cannot be discovered just by
