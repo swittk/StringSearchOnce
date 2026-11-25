@@ -142,6 +142,9 @@ class ByteCache<T> {
   private entries = new Map<string, { value: T; bytes: number }>();
   bytes = 0;
   constructor(readonly limit: number) {}
+  has(key: string): boolean {
+    return this.entries.has(key);
+  }
   get(key: string): T | undefined {
     const found = this.entries.get(key);
     if (!found) return undefined;
@@ -459,25 +462,33 @@ export class PostingReader {
     const key = kind + ':' + page;
     const hit = this.pageCache.get(key);
     if (hit) return hit;
-    let pending = this.pendingPages.get(key);
-    if (!pending) {
-      pending = (async () => {
-        this.counters.storeReads++;
-        const pages = await this.store.readPages(this.manifest.generation, kind, [page]);
-        this.counters.pagesRead += pages.size;
+    const pending = this.pendingPages.get(key);
+    if (pending) return pending;
+    this.startPageReads(kind, [page]);
+    return this.pendingPages.get(key)!;
+  }
+  private startPageReads(kind: PostingPageKind, numbers: readonly number[]): void {
+    const read = (async () => {
+      this.counters.storeReads++;
+      const pages = await this.store.readPages(this.manifest.generation, kind, numbers);
+      this.counters.pagesRead += pages.size;
+      return pages;
+    })();
+    // A 128-character ID can double through JSON escaping. Count quotes,
+    // separators and array brackets for a full page.
+    const maxBytes = kind === 'ids' ? this.manifest.idsPerPage * (128 * 2 + 3) + 1 : 131072;
+    for (const page of numbers) {
+      const key = kind + ':' + page;
+      const pending = read.then((pages) => {
         const value = pages.get(page);
         if (!value) throw new Error('POSTING_PAGE_MISSING:' + kind + ':' + page);
-        // A 128-character ID can double through JSON escaping. Count quotes,
-        // separators and array brackets for a full page.
-        const maxBytes = kind === 'ids' ? this.manifest.idsPerPage * (128 * 2 + 3) + 1 : 131072;
         const decoded = unpackPostingPage(value, maxBytes);
         this.counters.pageDecodes++;
         this.pageCache.put(key, decoded, decoded.byteLength);
         return decoded;
-      })().finally(() => this.pendingPages.delete(key));
+      }).finally(() => this.pendingPages.delete(key));
       this.pendingPages.set(key, pending);
     }
-    return pending;
   }
   private async readChunk(chunk: PostingChunk): Promise<Uint32Array> {
     const key = chunk[0] + ':' + chunk[1] + ':' + chunk[2];
@@ -575,34 +586,34 @@ export class PostingReader {
     );
   }
   private async objectIds(ordinals: readonly number[]): Promise<string[]> {
-    const pages = new Map<number, readonly string[]>();
+    const pages = new Map<number, readonly string[] | undefined>();
+    let missing: number[] | undefined;
     for (const ordinal of ordinals) {
       const number = Math.floor(ordinal / this.manifest.idsPerPage);
       if (pages.has(number)) continue;
-      const key = String(number);
-      let ids = this.idCache.get(key);
-      if (!ids) {
-        const raw: unknown = JSON.parse(
-          new TextDecoder().decode(await this.readPage('ids', number))
-        );
-        const expected = Math.min(
-          this.manifest.idsPerPage,
-          this.manifest.documents - number * this.manifest.idsPerPage
-        );
-        if (!Array.isArray(raw) || raw.length !== expected)
-          throw new Error('POSTING_OBJECT_IDS_INVALID');
-        let size = 48;
-        let previousId = '';
-        for (const id of raw) {
-          if (typeof id !== 'string' || !/^[\x21-\x7e]{1,128}$/.test(id) || id <= previousId)
-            throw new Error('POSTING_OBJECT_IDS_INVALID');
-          previousId = id;
-          size += 24 + id.length * 2;
-        }
-        ids = raw;
-        this.idCache.put(key, ids, size);
-      }
+      const ids = this.idCache.get(String(number));
       pages.set(number, ids);
+      if (!ids) (missing ??= []).push(number);
+    }
+    if (missing?.length === 1) {
+      const number = missing[0]!;
+      pages.set(number, await this.readIdPage(number));
+    } else if (missing) {
+      // Bound each cold response even when a candidate batch touches many pages.
+      const idPageBatchSize = 4;
+      for (let start = 0; start < missing.length; start += idPageBatchSize) {
+        const batch = missing.slice(start, start + idPageBatchSize);
+        const unread: number[] = [];
+        for (const number of batch) {
+          const key = 'ids:' + number;
+          if (!this.idCache.has(String(number)) && !this.pageCache.has(key) && !this.pendingPages.has(key))
+            unread.push(number);
+        }
+        if (unread.length > 1) this.startPageReads('ids', unread);
+        await Promise.all(batch.map(async (number) => {
+          pages.set(number, await this.readIdPage(number));
+        }));
+      }
     }
     return ordinals.map(
       (ordinal) =>
@@ -610,6 +621,28 @@ export class PostingReader {
           ordinal % this.manifest.idsPerPage
         ]!
     );
+  }
+  private async readIdPage(number: number): Promise<readonly string[]> {
+    const key = String(number);
+    const hit = this.idCache.get(key);
+    if (hit) return hit;
+    const raw: unknown = JSON.parse(new TextDecoder().decode(await this.readPage('ids', number)));
+    const expected = Math.min(
+      this.manifest.idsPerPage,
+      this.manifest.documents - number * this.manifest.idsPerPage
+    );
+    if (!Array.isArray(raw) || raw.length !== expected)
+      throw new Error('POSTING_OBJECT_IDS_INVALID');
+    let size = 48;
+    let previousId = '';
+    for (const id of raw) {
+      if (typeof id !== 'string' || !/^[\x21-\x7e]{1,128}$/.test(id) || id <= previousId)
+        throw new Error('POSTING_OBJECT_IDS_INVALID');
+      previousId = id;
+      size += 24 + id.length * 2;
+    }
+    this.idCache.put(key, raw, size);
+    return raw;
   }
   /**
    * Return successive pages in tier/objectId order. A token is scoped to this immutable
@@ -814,18 +847,19 @@ export class PostingReader {
           Array.from(gramTerms, (term) => this.exact(term, includeCaseSensitiveKeys)), tick
         );
       }
-      const initialOrdinal = after && tierNumber === after.tier ? after.ordinal + 1 : 0;
-      if (cursor.peek() < initialOrdinal) await cursor.seek(initialOrdinal);
-      while (cursor.peek() !== Infinity && result.results.length < resultLimit) {
+      let nextOrdinal = after && tierNumber === after.tier ? after.ordinal + 1 : 0;
+      while (result.results.length < resultLimit && cursor.peek() !== Infinity) {
         const candidates: number[] = [];
         const size = Math.min(batchSize, resultLimit - result.results.length);
-        while (cursor.peek() !== Infinity && candidates.length < size) {
+        while (candidates.length < size) {
+          let ordinal = cursor.peek();
+          if (ordinal < nextOrdinal) ordinal = await cursor.seek(nextOrdinal);
+          if (ordinal === Infinity) break;
           tick();
-          const ordinal = cursor.peek();
-          await cursor.seek(ordinal + 1);
+          nextOrdinal = ordinal + 1;
           if (!accepted.has(ordinal) && sourceRows.get(ordinal) !== null) candidates.push(ordinal);
         }
-        if (!candidates.length) continue;
+        if (!candidates.length) break;
         const missing = candidates.filter((ordinal) => !sourceRows.has(ordinal));
         if (missing.length) {
           result.sourceCandidates += missing.length;

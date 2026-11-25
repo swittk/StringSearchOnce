@@ -148,11 +148,14 @@ test('Greek sigma is nominated consistently at exact, prefix and substring posit
   assert.deepEqual(sensitive.results.map(hit => hit.stage), ['exact', 'prefix', 'substring']);
 });
 
-test('case-sensitive coverage counts NFC code points before lowercasing', async () => {
+test('one-character coverage counts the query code points in its matching mode', async () => {
   const f = fixture([doc('a', 'İ'), doc('b', 'İZ'), doc('c', 'AİZ')]);
   const result = await f.reader.search(f.options('I\u0307', { caseSensitive: true }));
   assert.equal(result.coverage, 'prefix-only');
   assert.deepEqual(ids(result), ['a', 'b']);
+  const folded = await f.reader.search(f.options('İ'));
+  assert.equal(folded.coverage, 'substring');
+  assert.deepEqual(ids(folded), ['a', 'b', 'c']);
 });
 
 test('case-sensitive nomination preserves boundaries that lowercase NFC changes', async () => {
@@ -298,6 +301,25 @@ test('continuation intersects only the suffix of the saved tier', async () => {
   }
 });
 
+test('a full result batch skips the next intersected candidate until needed', async () => {
+  const input = [doc('000', 'Oak desk lamp'), doc('001', 'Oak desk lamp')];
+  for (let i = 2; i < 202; i++) {
+    input.push(doc(String(i).padStart(3, '0'), i % 2 === 0 ? 'Oak desk' : 'Oak lamp'));
+  }
+  const f = fixture(input);
+  const options = f.options('desk lamp', { limit: 1, maxCursorSteps: 20 });
+  assert.deepEqual(ids(await f.reader.search(options)), ['000']);
+  const filtered = await f.reader.search({
+    ...options, filterCandidates: async rows => rows.filter(row => row.id !== '000'),
+  });
+  assert.deepEqual(ids(filtered), ['001']);
+  const page = await f.reader.searchPage({
+    ...options, scopeKey: 'catalog', signingKey: 'fixture-signing-key',
+  });
+  assert.deepEqual(ids(page), ['000']);
+  assert(page.nextCursor);
+});
+
 test('repeated query words share their word-prefix lookup work', async () => {
   const f = fixture([doc('a', 'Oak desktop'), doc('b', 'Oak desks')]);
   const single = await f.reader.search(f.options('desk'));
@@ -347,6 +369,35 @@ test('broad repeated terms retrieve only a bounded ranked prefix and reuse warm 
   // Fetches source rows anew even with a warm posting cache.
   f.rows.delete(input[0].id);
   assert.equal(ids(await f.reader.search(f.options('generic lamp')))[0], input[1].id);
+});
+
+test('cold ID pages are batched in order and shared across concurrent searches', async () => {
+  const input = Array.from({ length: 6 }, (_, i) => doc(String(i), 'Desk'));
+  const f = fixture(input, { idsPerPage: 1 }, { idCacheBytes: 0 });
+  const options = f.options('desk', { limit: input.length });
+  const results = await Promise.all([f.reader.search(options), f.reader.search(options)]);
+  const expected = input.map(row => row.id);
+  for (const result of results) assert.deepEqual(ids(result), expected);
+  assert.deepEqual(ids(await f.reader.search(options)), expected);
+  assert.deepEqual(f.reads.filter(read => read.kind === 'ids').map(read => read.pages), [
+    [0, 1, 2, 3], [4, 5],
+  ]);
+});
+
+test('a failed ID page request can be retried', async () => {
+  const f = fixture([doc('a', 'Desk'), doc('b', 'Desk')], { idsPerPage: 1 });
+  const failure = new Error('temporary store failure');
+  let idReads = 0;
+  const reader = new PostingReader(f.built.manifest, {
+    async readPages(_generation, kind, pages) {
+      if (kind === 'ids' && ++idReads === 1) throw failure;
+      return new Map(pages.map(page => [page, f.built.pages.get(kind)[page]]));
+    },
+  });
+  const options = f.options('desk', { limit: 2 });
+  await assert.rejects(reader.search(options), error => error === failure);
+  assert.deepEqual(ids(await reader.search(options)), ['a', 'b']);
+  assert.equal(idReads, 2);
 });
 
 test('worker builds identical binary pages while the calling event loop progresses', async () => {
@@ -413,4 +464,16 @@ test('aborted worker builds reject and close', async () => {
   const pending = buildPostingGenerationInWorker(documents, { generation: 'abort-fixture', kinds }, controller.signal);
   controller.abort();
   await assert.rejects(pending, /POSTING_BUILD_CANCELLED/);
+});
+
+test('cancelling from a source getter stops worker batch preparation', async () => {
+  const controller = new AbortController();
+  let readLaterRow = false;
+  const input = [
+    { id: 'a', get names() { controller.abort(); return []; } },
+    { id: 'b', get names() { readLaterRow = true; return []; } },
+  ];
+  const options = { generation: 'abort-fixture', kinds };
+  await assert.rejects(buildPostingGenerationInWorker(input, options, controller.signal), /POSTING_BUILD_CANCELLED/);
+  assert.equal(readLaterRow, false);
 });

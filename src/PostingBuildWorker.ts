@@ -63,6 +63,7 @@ export async function buildPostingGenerationInWorker(
                 fields.push(kind, text);
                 count++;
               }
+              if (settled) return;
               nameCounts.push(count);
             }
             worker.postMessage({ type: 'rows', fields, nameCounts });

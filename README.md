@@ -105,9 +105,12 @@ accents and combining marks. Search uses Unicode code points.
 The reader ranks exact names by kind, then whole-name prefixes by kind, then
 all-word token-prefix matches, then interior substring matches. Within a tier,
 source IDs sort in bytewise order. Words can match different names on the same
-record. Ordinary one-character searches have prefix-only coverage, while
-standalone symbols can use substring coverage. Queries containing only
-multiple ordinary one-character words are not supported.
+record. A query with one ordinary code point has prefix-only coverage.
+The reader counts code points in the trimmed query after case folding by
+default, or after NFC normalization alone in `caseSensitive` mode. For
+example, `İ` can use substring coverage by default because it folds to two
+code points. Standalone symbols can also use substring coverage. Queries
+containing only multiple ordinary one-character words are not supported.
 
 The fetch callback must enforce the caller's access rules and current source
 filters. Deleted, denied, and stale-name candidates are excluded before the
