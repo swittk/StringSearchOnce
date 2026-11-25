@@ -30,14 +30,22 @@ const result = await reader.search({
 });
 if (result.results[0]?.object.id !== '01') throw Error('Bad consumer result');
 `;
-    writeFileSync(join(dir,'esm.mjs'), `import {buildPostingGenerationInWorker,PostingReader} from 'stringsearchonce';
-` + body);
+    const esm = `import {buildPostingGenerationInWorker,PostingReader} from 'stringsearchonce';\n` + body;
+    writeFileSync(join(dir,'esm.mjs'), esm);
     writeFileSync(join(dir,'cjs.cjs'), `const {buildPostingGenerationInWorker,PostingReader}=require('stringsearchonce');
 (async()=>{
 ${body}
 })().catch(e=>{console.error(e);process.exitCode=1});`);
     run(process.execPath, ['esm.mjs']);
     run(process.execPath, ['cjs.cjs']);
+    execFileSync(process.execPath, ['--input-type=module', '--max-old-space-size=1024'], {
+      cwd: dir, input: esm, stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    run(process.execPath, ['--input_type', 'module', '--eval', esm]);
+    execFileSync(process.execPath, [], {
+      cwd: dir, env: { ...process.env, NODE_OPTIONS: '--input-type=module' },
+      input: esm, stdio: ['pipe', 'pipe', 'pipe'],
+    });
     const typed = `
 const rows: PostingDocument[] = [{id:'01',names:[{kind:'title',text:'Desk'}]}];
 const built = buildPostingGeneration(rows,{generation:'test',kinds:['title']});

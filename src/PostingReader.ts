@@ -652,8 +652,9 @@ export class PostingReader {
    * change. An index generation change also invalidates the token.
    */
   async searchPage<T>(options: PostingPageOptions<T>): Promise<PostingPageResult<T>> {
-    checkPostingQueryLength(options.text);
     const { signingKey, scopeKey, cursor, ...request } = options;
+    const { text } = request;
+    checkPostingQueryLength(text);
     const limit = request.limit ?? 10;
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100)
       throw new Error('POSTING_PAGE_OPTIONS_INVALID');
@@ -668,7 +669,7 @@ export class PostingReader {
         JSON.stringify([
           this.manifest.generation,
           this.manifest.kinds,
-          request.text.normalize('NFC'),
+          text.normalize('NFC'),
           Boolean(request.caseSensitive),
           scopeKey,
         ])
@@ -718,7 +719,7 @@ export class PostingReader {
     }
     // One extra accepted row proves there really is another page. Never count a
     // denied row or a stale-name false positive as proof that more results exist.
-    const { result, positions } = await this.searchRun(request, after, true);
+    const { result, positions } = await this.searchRun(request, text, after, true);
     if (result.results.length <= limit) return result;
     const last = positions[limit - 1]!;
     const payload = Buffer.from(JSON.stringify([1, digest, last.tier, last.ordinal])).toString(
@@ -729,8 +730,9 @@ export class PostingReader {
   }
   /** Search starts at the beginning when no paging cursor was provided. */
   async search<T>(options: PostingSearchOptions<T>): Promise<PostingSearchResult<T>> {
-    checkPostingQueryLength(options.text);
-    return (await this.searchRun(options)).result;
+    const { text } = options;
+    checkPostingQueryLength(text);
+    return (await this.searchRun(options, text)).result;
   }
   /**
    * Continue from a global rank/ID pair. The ID may belong to a newer live
@@ -742,28 +744,19 @@ export class PostingReader {
     last?: { stage: PostingStage; kind: string; id: string }
   ): Promise<PostingSearchResult<T>> {
     if (!last) return this.search(options);
-    checkPostingQueryLength(options.text);
+    const { text } = options;
+    checkPostingQueryLength(text);
+    const { id } = last;
     const tier = postingTierRank(last, createPostingKindRanks(this.manifest.kinds));
-    if (tier === undefined || !/^[\x21-\x7e]{1,128}$/.test(last.id))
+    if (tier === undefined || !/^[\x21-\x7e]{1,128}$/.test(id))
       throw new Error('POSTING_RANK_CURSOR_INVALID');
-    if (!options.text.trim()) return (await this.searchRun(options)).result;
-    await this.open();
-    // Search the sorted ordinal->ID mapping. The continuation object may have
-    // been inserted after the frozen snapshot, so equality is not required.
-    let low = 0,
-      high = this.manifest.documents;
-    while (low < high) {
-      const mid = (low + high) >>> 1;
-      const [id] = await this.objectIds([mid]);
-      if (id! <= last.id) low = mid + 1;
-      else high = mid;
-    }
-    return (await this.searchRun(options, { tier, ordinal: low - 1 })).result;
+    return (await this.searchRun(options, text, { tier, id })).result;
   }
   /** Find the ranked prefix of authorized matches, without fetching/sorting the entire candidate set. */
   private async searchRun<T>(
     options: PostingSearchOptions<T>,
-    after?: { tier: number; ordinal: number },
+    text: string,
+    after?: { tier: number; ordinal: number } | { tier: number; id: string },
     includeLookahead = false
   ): Promise<{
     result: PostingSearchResult<T>;
@@ -785,9 +778,7 @@ export class PostingReader {
     )
       throw new Error('POSTING_QUERY_LIMITS');
     const resultLimit = includeLookahead ? limit + 1 : limit;
-    const matchingPhrase = caseSensitive
-      ? options.text.normalize('NFC').trim()
-      : foldPostingText(options.text);
+    const matchingPhrase = caseSensitive ? text.normalize('NFC').trim() : foldPostingText(text);
     const lookupPhrase = caseSensitive ? lowercasePostingText(matchingPhrase) : matchingPhrase;
     const words = lookupPhrase.split(/\s+/u).filter(Boolean);
     const ordinarySingleCharacter = /^[^\p{S}]$/u.test(matchingPhrase);
@@ -804,6 +795,19 @@ export class PostingReader {
     if (!words.length) return { result, positions };
     if (words.length > 32) throw new Error('POSTING_QUERY_TOO_LONG');
     await this.open();
+    if (after && 'id' in after) {
+      const { tier, id } = after;
+      // The continuation ID can lie between two IDs in the frozen snapshot.
+      let low = 0,
+        high = this.manifest.documents;
+      while (low < high) {
+        const mid = (low + high) >>> 1;
+        const [midId] = await this.objectIds([mid]);
+        if (midId! <= id) low = mid + 1;
+        else high = mid;
+      }
+      after = { tier, ordinal: low - 1 };
+    }
     const includeCaseSensitiveKeys =
       caseSensitive && this.terms.at(-1)?.startsWith(caseSensitivePostingPrefix);
     const matchingWords = caseSensitive ? matchingPhrase.split(/\s+/u) : words;

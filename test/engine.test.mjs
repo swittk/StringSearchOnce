@@ -300,6 +300,34 @@ test('rank/ID continuation need not refer to an object in the snapshot', async (
   assert.deepEqual(ids(result), oracle(documents,'café').slice(1));
 });
 
+test('rank continuation keeps the validated query while opening the reader', async () => {
+  const f = fixture([doc('a', 'Desk'), doc('b', 'Desk')]);
+  const options = f.options('desk');
+  const reader = new PostingReader(f.built.manifest, {
+    async readPages(_generation, kind, pages) {
+      if (kind === 'lexicon') options.text = ' '.repeat(513);
+      return new Map(pages.map(page => [page, f.built.pages.get(kind)[page]]));
+    },
+  });
+  const boundary = { stage: 'exact', kind: 'title', id: 'a' };
+  assert.deepEqual(ids(await reader.searchAfterRank(options, boundary)), ['b']);
+  await assert.rejects(reader.searchAfterRank(options, boundary), /POSTING_QUERY_TOO_LONG/);
+});
+
+test('rank continuation uses one ID during the ordinal lookup', async () => {
+  const f = fixture([...'abcdef'].map(id => doc(id, 'Desk')), { idsPerPage: 1 });
+  const boundary = { stage: 'exact', kind: 'title', id: 'e' };
+  let idReads = 0;
+  const reader = new PostingReader(f.built.manifest, {
+    async readPages(_generation, kind, pages) {
+      if (kind === 'ids' && ++idReads === 2) boundary.id = 'a';
+      return new Map(pages.map(page => [page, f.built.pages.get(kind)[page]]));
+    },
+  });
+  assert.deepEqual(ids(await reader.searchAfterRank(f.options('desk'), boundary)), ['f']);
+  assert.deepEqual(ids(await reader.searchAfterRank(f.options('desk'), boundary)), ['b', 'c', 'd', 'e', 'f']);
+});
+
 test('continuation intersects only the suffix of the saved tier', async () => {
   for (const [stage, prefix] of [['word-prefix', 'Oak '], ['substring', 'Oak X']]) {
     const input = Array.from({ length: 200 }, (_, i) =>
