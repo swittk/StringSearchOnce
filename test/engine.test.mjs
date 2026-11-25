@@ -567,6 +567,33 @@ test('fully overlapping streams load only a bounded ranked prefix and honor look
   assert.equal(exhausted.nextCursor, undefined);
 });
 
+test('composite rejects incompatible query budgets before starting any stream', async () => {
+  const { reader, options, reads } = fixture([
+    doc('01', 'Desk'), doc('02', 'Desk'), doc('03', 'Desk'), doc('04', 'Desk'), doc('05', 'Desk'),
+  ], { idsPerPage: 1 });
+  let liveCalls = 0;
+  const request = options('desk', {
+    limit: 1,
+    scopeKey: 'catalog',
+    signingKey: 'example-server-signing-key',
+    readLive: async () => {
+      liveCalls++;
+      return [];
+    },
+  });
+  const first = await PostingReader.searchCompositePage([reader], request);
+  assert(first.nextCursor);
+  const pageReads = reads.length;
+  for (const cursor of [undefined, first.nextCursor]) {
+    await assert.rejects(
+      PostingReader.searchCompositePage([reader], { ...request, cursor, limit: 5, maxSourceCandidates: 2 }),
+      /POSTING_QUERY_LIMITS/
+    );
+  }
+  assert.equal(liveCalls, 1);
+  assert.equal(reads.length, pageReads);
+});
+
 test('composite failure waits for active source reads to settle', async () => {
   const { reader, options, rows } = fixture([doc('01', 'Desk')]);
   let started, finish;

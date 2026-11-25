@@ -30,9 +30,9 @@ const search = {
 };
 const result = await reader.search(search);
 if (result.results[0]?.object.id !== '01') throw Error('Bad consumer result');
-for await (const ids of reader.idBatches()) {
-  if (ids.length !== 1 || ids[0] !== '01') throw Error('Bad ID batch');
-}
+const allIds = [];
+for await (const ids of reader.idBatches()) allIds.push(...ids);
+if (allIds.length !== 1 || allIds[0] !== '01') throw Error('Bad ID sequence');
 const page = await PostingReader.searchCompositePage([reader], {
   ...search, scopeKey:'catalog', signingKey:'example-server-signing-key',
 });

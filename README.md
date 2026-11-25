@@ -156,10 +156,11 @@ match per ID in rank order. Ties keep the first reader's result, with live
 results last. The page reads at most one prefix of `limit + 1` hits per stream.
 Reader work limits apply to each reader. Bound live work in `readLive`.
 
-Pass `nextCursor` to continue with the same ordered generations, query and
-scope. Live edits can move a match across the cursor. Include a live revision
-in `scopeKey` to restart traversal on such edits. The caller owns live
-nomination, source reads and publication.
+Pass `nextCursor` with the same ordered generations and kinds, query,
+`caseSensitive` setting, `scopeKey`, signing key and live-stream presence.
+Live edits can move a match across the cursor. Include a live revision in
+`scopeKey` to restart traversal on such edits. The caller owns live nomination,
+source reads and publication.
 
 The reader has explicit limits for cache size, lexicon size, candidate reads,
 and cursor work. Exceeding a limit throws rather than returning silently

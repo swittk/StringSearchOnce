@@ -113,6 +113,23 @@ export type PostingSearchOptions<T> = {
   maxSourceCandidates?: number;
   maxCursorSteps?: number;
 };
+
+function postingQueryLimits({
+  limit = 10,
+  batchSize = 20,
+  maxSourceCandidates = 10000,
+  maxCursorSteps = 1000000,
+}: Pick<PostingSearchOptions<unknown>, 'limit' | 'batchSize' | 'maxSourceCandidates' | 'maxCursorSteps'>) {
+  const limits = [limit, batchSize, maxSourceCandidates, maxCursorSteps] as const;
+  if (
+    !limits.every((n) => Number.isSafeInteger(n) && n > 0) ||
+    batchSize > 100 ||
+    limit > maxSourceCandidates
+  )
+    throw new Error('POSTING_QUERY_LIMITS');
+  return limits;
+}
+
 /** The signed cursor binds the ordering, query and every caller-specific source filter. */
 export type PostingPageOptions<T> = PostingSearchOptions<T> & {
   cursor?: string;
@@ -777,6 +794,7 @@ export class PostingReader {
     const { signingKey, scopeKey, cursor, limit = 10, readLive } = options;
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100 || !scopeKey || signingKey.length < 16)
       throw new Error('POSTING_PAGE_OPTIONS_INVALID');
+    const limits = postingQueryLimits(options);
     const { kinds } = readers[0].manifest;
     const generations: string[] = [];
     for (const { manifest } of readers) {
@@ -801,7 +819,7 @@ export class PostingReader {
     const nonblank = Boolean(options.text.trim());
     const snapshotReads = readers.map(async (reader) => {
       const position = after && nonblank ? await reader.rankPosition(afterTier, after.id) : undefined;
-      return reader.searchRun(options, position, true);
+      return reader.searchRun(options, position, true, limits);
     });
     const liveRead = nonblank && readLive ? Promise.resolve().then(() => readLive(after, limit + 1)) : [];
     const [snapshots, live] = await Promise.all([Promise.all(snapshotReads), liveRead]).catch(async (error: unknown) => {
@@ -873,7 +891,7 @@ export class PostingReader {
     let low = 0,
       high = this.manifest.documents;
     while (low < high) {
-      const mid = (low + high) >>> 1;
+      const mid = Math.floor((low + high) / 2);
       const page = Math.floor(mid / idsPerPage);
       if (page !== loadedPage) {
         ids = await this.readIdPage(page);
@@ -888,25 +906,13 @@ export class PostingReader {
   private async searchRun<T>(
     options: PostingSearchOptions<T>,
     after?: { tier: number; ordinal: number },
-    includeLookahead = false
+    includeLookahead = false,
+    limits = postingQueryLimits(options)
   ): Promise<{
     result: PostingSearchResult<T>;
     positions: Array<{ tier: number; ordinal: number }>;
   }> {
-    const {
-      limit = 10,
-      batchSize = 20,
-      maxSourceCandidates = 10000,
-      maxCursorSteps = 1000000,
-    } = options;
-    if (
-      ![limit, batchSize, maxSourceCandidates, maxCursorSteps].every(
-        (n) => Number.isSafeInteger(n) && n > 0
-      ) ||
-      batchSize > 100 ||
-      limit > maxSourceCandidates
-    )
-      throw new Error('POSTING_QUERY_LIMITS');
+    const [limit, batchSize, maxSourceCandidates, maxCursorSteps] = limits;
     const resultLimit = includeLookahead ? limit + 1 : limit;
     const matchingPhrase = options.caseSensitive
       ? options.text.normalize('NFC').trim()
