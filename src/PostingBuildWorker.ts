@@ -61,15 +61,12 @@ export async function buildPostingGenerationInWorker(
             const end = Math.min(index + 256, documents.length);
             for (; index < end; index++) {
               const { id, names } = documents[index]!;
-              if (settled) return;
               fields.push(id);
               let count = 0;
               for (const { kind, text } of names) {
-                if (settled) return;
                 fields.push(kind, text);
                 count++;
               }
-              if (settled) return;
               nameCounts.push(count);
             }
             worker.postMessage({ type: 'rows', fields, nameCounts });

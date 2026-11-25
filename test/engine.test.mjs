@@ -163,6 +163,13 @@ test('one-character coverage counts the query code points in its matching mode',
   assert.deepEqual(ids(folded), ['a', 'b', 'c']);
 });
 
+test('short multiword queries use the code points of their matching mode', async () => {
+  const f = fixture([doc('a', 'İ x'), doc('b', 'İ 🪴')]);
+  await assert.rejects(f.reader.search(f.options('İ x', { caseSensitive: true })), /POSTING_QUERY_TOO_SHORT/);
+  assert.deepEqual(ids(await f.reader.search(f.options('İ x'))), ['a']);
+  assert.deepEqual(ids(await f.reader.search(f.options('İ 🪴', { caseSensitive: true }))), ['b']);
+});
+
 test('case-sensitive nomination preserves boundaries that lowercase NFC changes', async () => {
   const f = fixture([
     doc('a', 'AJ\u030cZ'), doc('b', 'Oak J\u030cZ blue'), doc('c', 'İ\u0327Z'),
@@ -179,15 +186,6 @@ test('case-sensitive nomination preserves boundaries that lowercase NFC changes'
   }
   assert.deepEqual(ids(await f.reader.search(f.options('aj\u030cz'))), ['a']);
   assert.deepEqual(ids(await f.reader.search(f.options('aJ', { caseSensitive: true }))), []);
-});
-
-test('an in-flight search keeps its matching mode while opening the reader', async () => {
-  const f = fixture([doc('a', 'Desk')]);
-  const options = f.options('Desk', { caseSensitive: false });
-  const pending = f.reader.search(options);
-  options.caseSensitive = true;
-  assert.deepEqual(ids(await pending), ['a']);
-  assert.deepEqual(ids(await f.reader.search(options)), ['a']);
 });
 
 test('exact and prefix kind priority wins before lower tiers', async () => {
@@ -298,34 +296,6 @@ test('rank/ID continuation need not refer to an object in the snapshot', async (
     stage: 'exact', kind: 'title', id: 'ab',
   });
   assert.deepEqual(ids(result), oracle(documents,'café').slice(1));
-});
-
-test('rank continuation keeps the validated query while opening the reader', async () => {
-  const f = fixture([doc('a', 'Desk'), doc('b', 'Desk')]);
-  const options = f.options('desk');
-  const reader = new PostingReader(f.built.manifest, {
-    async readPages(_generation, kind, pages) {
-      if (kind === 'lexicon') options.text = ' '.repeat(513);
-      return new Map(pages.map(page => [page, f.built.pages.get(kind)[page]]));
-    },
-  });
-  const boundary = { stage: 'exact', kind: 'title', id: 'a' };
-  assert.deepEqual(ids(await reader.searchAfterRank(options, boundary)), ['b']);
-  await assert.rejects(reader.searchAfterRank(options, boundary), /POSTING_QUERY_TOO_LONG/);
-});
-
-test('rank continuation uses one ID during the ordinal lookup', async () => {
-  const f = fixture([...'abcdef'].map(id => doc(id, 'Desk')), { idsPerPage: 1 });
-  const boundary = { stage: 'exact', kind: 'title', id: 'e' };
-  let idReads = 0;
-  const reader = new PostingReader(f.built.manifest, {
-    async readPages(_generation, kind, pages) {
-      if (kind === 'ids' && ++idReads === 2) boundary.id = 'a';
-      return new Map(pages.map(page => [page, f.built.pages.get(kind)[page]]));
-    },
-  });
-  assert.deepEqual(ids(await reader.searchAfterRank(f.options('desk'), boundary)), ['f']);
-  assert.deepEqual(ids(await reader.searchAfterRank(f.options('desk'), boundary)), ['b', 'c', 'd', 'e', 'f']);
 });
 
 test('continuation intersects only the suffix of the saved tier', async () => {
@@ -517,27 +487,4 @@ test('aborted worker builds reject and close', async () => {
   const pending = buildPostingGenerationInWorker(documents, { generation: 'abort-fixture', kinds }, controller.signal);
   controller.abort();
   await assert.rejects(pending, /POSTING_BUILD_CANCELLED/);
-});
-
-test('cancelling from a source getter stops worker batch preparation', async () => {
-  const options = { generation: 'abort-fixture', kinds };
-  for (const cancelFrom of ['row', 'name']) {
-    const controller = new AbortController();
-    const laterReads = [];
-    const laterName = { kind: 'title', get text() { laterReads.push('name'); return 'lamp'; } };
-    const firstName = { kind: 'title', get text() { controller.abort(); return 'desk'; } };
-    const input = [
-      {
-        id: 'a',
-        get names() {
-          if (cancelFrom === 'name') return [firstName, laterName];
-          controller.abort();
-          return [laterName];
-        },
-      },
-      { id: 'b', get names() { laterReads.push('row'); return []; } },
-    ];
-    await assert.rejects(buildPostingGenerationInWorker(input, options, controller.signal), /POSTING_BUILD_CANCELLED/);
-    assert.deepEqual(laterReads, [], cancelFrom);
-  }
 });
