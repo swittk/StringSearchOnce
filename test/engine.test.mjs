@@ -26,15 +26,15 @@ const documents = [
   doc('l', 'Classic lamp', 'Azure'),
 ];
 
-function fixture(input = documents, overrides = {}) {
+function fixture(input = documents, overrides = {}, readerOptions) {
   const built = buildPostingGeneration(input, {
     generation: 'fixture-1', kinds, chunkIds: 8, pageBytes: 128, idsPerPage: 8,
     ...overrides,
   });
-  return fromBuilt(built, input);
+  return fromBuilt(built, input, readerOptions);
 }
 
-function fromBuilt(built, input) {
+function fromBuilt(built, input, readerOptions) {
   const rows = new Map(input.map(row => [row.id, row]));
   const reads = [];
   const store = {
@@ -44,7 +44,7 @@ function fromBuilt(built, input) {
       return new Map(pages.map(page => [page, built.pages.get(kind)[page]]));
     },
   };
-  const reader = new PostingReader(built.manifest, store);
+  const reader = new PostingReader(built.manifest, store, readerOptions);
   const options = (text, extra = {}) => ({
     text, fetchSources: async ids => ids.flatMap(id => rows.has(id) ? [rows.get(id)] : []),
     getId: row => row.id, getNames: row => row.names, ...extra,
@@ -155,6 +155,24 @@ test('case-sensitive coverage counts NFC code points before lowercasing', async 
   assert.deepEqual(ids(result), ['a', 'b']);
 });
 
+test('case-sensitive nomination preserves boundaries that lowercase NFC changes', async () => {
+  const f = fixture([
+    doc('a', 'AJ\u030cZ'), doc('b', 'Oak J\u030cZ blue'), doc('c', 'İ\u0327Z'),
+  ]);
+  for (const [text, expected] of [
+    ['AJ\u030cZ', [['a', 'exact']]],
+    ['AJ', [['a', 'prefix']]],
+    ['J blue', [['b', 'word-prefix']]],
+    ['\u030cZ', [['a', 'substring'], ['b', 'substring']]],
+    ['\u0327Z', [['c', 'substring']]],
+  ]) {
+    const result = await f.reader.search(f.options(text, { caseSensitive: true }));
+    assert.deepEqual(result.results.map(hit => [hit.object.id, hit.stage]), expected, text);
+  }
+  assert.deepEqual(ids(await f.reader.search(f.options('aj\u030cz'))), ['a']);
+  assert.deepEqual(ids(await f.reader.search(f.options('aJ', { caseSensitive: true }))), []);
+});
+
 test('exact and prefix kind priority wins before lower tiers', async () => {
   const f = fixture();
   const result = await f.reader.search(f.options('café', { limit: 30 }));
@@ -254,6 +272,28 @@ test('rank/ID continuation need not refer to an object in the snapshot', async (
     stage: 'exact', kind: 'title', id: 'ab',
   });
   assert.deepEqual(ids(result), oracle(documents,'café').slice(1));
+});
+
+test('query entrypoints reject oversized blanks before reading index pages', async () => {
+  const f = fixture();
+  const options = f.options(' '.repeat(513));
+  const signed = { ...options, scopeKey: 'demo:catalog:visible', signingKey: 'synthetic-test-signing-key' };
+  await assert.rejects(f.reader.search(options), /POSTING_QUERY_TOO_LONG/);
+  await assert.rejects(f.reader.searchPage(signed), /POSTING_QUERY_TOO_LONG/);
+  await assert.rejects(
+    f.reader.searchAfterRank(options, { stage: 'exact', kind: 'title', id: 'a' }),
+    /POSTING_QUERY_TOO_LONG/
+  );
+  assert.deepEqual(ids(await f.reader.search(f.options(' \t '))), []);
+  assert.deepEqual(f.reads, []);
+});
+
+test('prefix term limits accept an exact fit and reject the first excess', async () => {
+  const f = fixture([
+    doc('a', 'Desk lamp'), doc('b', 'Desk mat'), doc('c', 'Dusk'),
+  ], {}, { maxMatchedTerms: 2 });
+  assert.deepEqual(ids(await f.reader.search(f.options('desk'))), ['a', 'b']);
+  await assert.rejects(f.reader.search(f.options('d')), /POSTING_MATCHED_TERM_LIMIT/);
 });
 
 test('broad repeated terms retrieve only a bounded ranked prefix and reuse warm decodes', async () => {

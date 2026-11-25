@@ -57,9 +57,11 @@ The same API is available from CommonJS. For a large build, use
 synchronous builder. The worker is included in the package and constructs the
 index off the calling thread. The calling thread copies and serializes the
 selected fields in acknowledged batches of up to 256 rows. Large name values
-can still make a batch expensive to send. When bundling the library into a
-standalone application, retain the matching ESM or CJS packaged worker file
-beside the compiled entrypoint or keep the library external.
+can still make a batch expensive to send. Keep `stringsearchonce` external
+when bundling an application. If you inline it, place the packaged worker
+beside the bundle and match its module format and extension. Use a `.js`
+ESM bundle with `stringSearchBuilderWorker.js` or a `.cjs` CommonJS bundle
+with `stringSearchBuilderWorker.cjs`.
 
 ## Index and storage
 
@@ -113,7 +115,10 @@ layer.
 Use `reader.searchPage` for signed keyset pagination. Supply the same
 `scopeKey`, query and server-only `signingKey` on each page. Include
 the actual caller identity, collection and filters in the scope. A different
-generation, query or scope invalidates the cursor. `searchAfterRank` continues
+generation, query or scope invalidates the cursor. Live name edits can move a
+row across the cursor and cause skipped or repeated results. To restart on
+such edits, include a source revision in `scopeKey` and start a new traversal
+when the revision changes. `searchAfterRank` continues
 after a rank and source-ID boundary for applications combining ranked streams.
 
 The reader has explicit limits for cache size, lexicon size, candidate reads,

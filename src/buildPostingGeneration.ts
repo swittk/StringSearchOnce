@@ -1,7 +1,6 @@
 import {
   comparePostingIds,
   encodePostingIds,
-  foldPostingText,
   packPostingJson,
   packPostingPage,
   postingGrams,
@@ -12,6 +11,14 @@ import {
   type PostingDocument,
   type PostingTerm,
 } from './postingFormat';
+import { caseSensitivePostingPrefix, lowercasePostingText } from './postingText';
+
+function addNameTerms(terms: Set<string>, kind: string, text: string): void {
+  terms.add(postingNameKey(kind, text));
+  for (const token of text.split(/\s+/u)) if (token) terms.add('w|' + token);
+  for (const width of [2, 3]) for (const gram of postingGrams(text, width)) terms.add(gram);
+  for (const char of text) if (/^\p{S}$/u.test(char)) terms.add('g1|' + char);
+}
 
 /** Offline build inputs. Nothing here reads or changes a live collection. */
 export type BuildPostingOptions = {
@@ -51,12 +58,19 @@ export function buildPostingGeneration(
     const terms = new Set<string>();
     for (const name of row.names) {
       if (!indexedKinds.has(name.kind)) throw new Error('POSTING_UNKNOWN_NAME_KIND');
-      const text = foldPostingText(name.text);
+      const lower = lowercasePostingText(name.text.normalize('NFC'));
+      const composed = lower.normalize('NFC');
+      const text = composed.trim();
       if (!text) continue;
-      terms.add(postingNameKey(name.kind, text));
-      for (const token of text.split(/\s+/u)) if (token) terms.add('w|' + token);
-      for (const width of [2, 3]) for (const gram of postingGrams(text, width)) terms.add(gram);
-      for (const char of text) if (/^\p{S}$/u.test(char)) terms.add('g1|' + char);
+      addNameTerms(terms, name.kind, text);
+      if (lower !== composed) {
+        // Keep only the extra keys needed to nominate case-sensitive matches.
+        const additional = new Set<string>();
+        addNameTerms(additional, name.kind, lower.trim());
+        for (const term of additional) {
+          if (!terms.has(term)) terms.add(caseSensitivePostingPrefix + term);
+        }
+      }
     }
     for (const term of terms) {
       let list = postings.get(term);

@@ -13,6 +13,11 @@ import {
   type PostingPageStore,
   type PostingTerm,
 } from './postingFormat';
+import { caseSensitivePostingPrefix, lowercasePostingText } from './postingText';
+
+function checkPostingQueryLength(text: string): void {
+  if (text.length > 512) throw new Error('POSTING_QUERY_TOO_LONG');
+}
 
 /** The index supplies rank tiers; no source-object relevance sort runs during search. */
 export type PostingStage = 'exact' | 'prefix' | 'word-prefix' | 'substring';
@@ -516,17 +521,32 @@ export class PostingReader {
     }
     return [this.terms[index]!, this.counts[index]!, chunks];
   }
-  private exact(term: string): readonly PostingTerm[] {
+  private exact(term: string, includeCaseSensitiveKeys = false): readonly PostingTerm[] {
     const index = this.lowerBound(term);
-    return this.terms[index] === term ? [this.termAt(index)] : [];
+    const entries = this.terms[index] === term ? [this.termAt(index)] : [];
+    if (includeCaseSensitiveKeys) {
+      const additional = caseSensitivePostingPrefix + term;
+      const index = this.lowerBound(additional);
+      if (this.terms[index] === additional) entries.push(this.termAt(index));
+    }
+    return entries;
   }
-  private prefix(term: string): readonly PostingTerm[] {
+  private prefix(term: string, includeCaseSensitiveKeys = false): readonly PostingTerm[] {
+    const limit = this.options.maxMatchedTerms ?? 20000;
+    const entries: PostingTerm[] = [];
+    this.appendMatchingTerms(entries, term, limit);
+    if (includeCaseSensitiveKeys)
+      this.appendMatchingTerms(entries, caseSensitivePostingPrefix + term, limit - entries.length);
+    return entries;
+  }
+  private appendMatchingTerms(entries: PostingTerm[], term: string, remaining: number): void {
     const first = this.lowerBound(term);
+    const stop = Math.min(this.terms.length, first + remaining);
     let end = first;
-    while (end < this.terms.length && this.terms[end]!.startsWith(term)) end++;
-    if (end - first > (this.options.maxMatchedTerms ?? 20000))
+    while (end < stop && this.terms[end]!.startsWith(term)) end++;
+    if (end === stop && this.terms[end]?.startsWith(term))
       throw new Error('POSTING_MATCHED_TERM_LIMIT');
-    return Array.from({ length: end - first }, (_, offset) => this.termAt(first + offset));
+    for (let index = first; index < end; index++) entries.push(this.termAt(index));
   }
   private cursor(entries: readonly PostingTerm[], tick: () => void): Cursor {
     if (!entries.length) return emptyCursor();
@@ -595,10 +615,12 @@ export class PostingReader {
   /**
    * Return successive pages in tier/objectId order. A token is scoped to this immutable
    * generation, search text and caller's source query; it cannot be edited to skip rows.
-   * Rows edited between requests are reverified. An index generation change invalidates
-   * the token rather than silently mixing two different posting orders.
+   * Each request rechecks current rows. Live rank changes can move rows across the
+   * cursor. Include a source revision in scopeKey to restart traversal when ranks
+   * change. An index generation change also invalidates the token.
    */
   async searchPage<T>(options: PostingPageOptions<T>): Promise<PostingPageResult<T>> {
+    checkPostingQueryLength(options.text);
     const { signingKey, scopeKey, cursor, ...request } = options;
     const limit = request.limit ?? 10;
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100)
@@ -675,6 +697,7 @@ export class PostingReader {
   }
   /** Search starts at the beginning when no paging cursor was provided. */
   async search<T>(options: PostingSearchOptions<T>): Promise<PostingSearchResult<T>> {
+    checkPostingQueryLength(options.text);
     return (await this.searchRun(options)).result;
   }
   /**
@@ -687,6 +710,7 @@ export class PostingReader {
     last?: { stage: PostingStage; kind: string; id: string }
   ): Promise<PostingSearchResult<T>> {
     if (!last) return this.search(options);
+    checkPostingQueryLength(options.text);
     const tier = postingTierRank(last, createPostingKindRanks(this.manifest.kinds));
     if (tier === undefined || !/^[\x21-\x7e]{1,128}$/.test(last.id))
       throw new Error('POSTING_RANK_CURSOR_INVALID');
@@ -727,9 +751,11 @@ export class PostingReader {
     )
       throw new Error('POSTING_QUERY_LIMITS');
     const resultLimit = includeLookahead ? limit + 1 : limit;
-    const folded = foldPostingText(options.text),
-      words = folded.split(/\s+/u).filter(Boolean);
-    const matchingPhrase = options.caseSensitive ? options.text.normalize('NFC').trim() : folded;
+    const matchingPhrase = options.caseSensitive
+      ? options.text.normalize('NFC').trim()
+      : foldPostingText(options.text);
+    const lookupPhrase = options.caseSensitive ? lowercasePostingText(matchingPhrase) : matchingPhrase;
+    const words = lookupPhrase.split(/\s+/u).filter(Boolean);
     const ordinarySingleCharacter = /^[^\p{S}]$/u.test(matchingPhrase);
     const result: PostingSearchResult<T> = {
       generation: this.manifest.generation,
@@ -742,8 +768,10 @@ export class PostingReader {
     };
     const positions: Array<{ tier: number; ordinal: number }> = [];
     if (!words.length) return { result, positions };
-    if (options.text.length > 512 || words.length > 32) throw new Error('POSTING_QUERY_TOO_LONG');
+    if (words.length > 32) throw new Error('POSTING_QUERY_TOO_LONG');
     await this.open();
+    const includeCaseSensitiveKeys =
+      options.caseSensitive && this.terms.at(-1)?.startsWith(caseSensitivePostingPrefix);
     const matchingWords = options.caseSensitive ? matchingPhrase.split(/\s+/u) : words;
     const tick = () => {
       if (++result.cursorSteps > maxCursorSteps) throw new Error('POSTING_CURSOR_LIMIT');
@@ -772,13 +800,19 @@ export class PostingReader {
       if (after && tierNumber < after.tier) continue;
       let cursor: Cursor;
       if (tier.stage === 'exact') {
-        cursor = this.cursor(this.exact(postingNameKey(tier.kind, folded)), tick);
+        const key = postingNameKey(tier.kind, lookupPhrase);
+        cursor = this.cursor(this.exact(key, includeCaseSensitiveKeys), tick);
       } else if (tier.stage === 'prefix') {
-        cursor = this.cursor(this.prefix(postingNameKey(tier.kind, folded)), tick);
+        const key = postingNameKey(tier.kind, lookupPhrase);
+        cursor = this.cursor(this.prefix(key, includeCaseSensitiveKeys), tick);
       } else if (tier.stage === 'word-prefix') {
-        cursor = await this.intersection(words.map((word) => this.prefix('w|' + word)), tick);
+        cursor = await this.intersection(
+          words.map((word) => this.prefix('w|' + word, includeCaseSensitiveKeys)), tick
+        );
       } else {
-        cursor = await this.intersection(Array.from(gramTerms, (term) => this.exact(term)), tick);
+        cursor = await this.intersection(
+          Array.from(gramTerms, (term) => this.exact(term, includeCaseSensitiveKeys)), tick
+        );
       }
       if (after && tierNumber === after.tier) await cursor.seek(after.ordinal + 1);
       while (cursor.peek() !== Infinity && result.results.length < resultLimit) {
