@@ -11,6 +11,7 @@ import {
   type PostingDocument,
   type PostingTerm,
 } from './postingFormat';
+import { maxPostingPages } from './postingLimits';
 import { caseSensitivePostingPrefix, lowercasePostingText } from './postingText';
 
 function addNameTerms(terms: Set<string>, kind: string, text: string): void {
@@ -86,7 +87,10 @@ export function buildPostingGeneration(
   let pendingPage = new Uint8Array(pageBytes),
     usedBytes = 0;
   const flushPostingPage = () => {
-    if (usedBytes) postingPages.push(packPostingPage(pendingPage.subarray(0, usedBytes)));
+    if (usedBytes) {
+      if (postingPages.length >= maxPostingPages) throw new Error('POSTING_BUILD_LIMITS');
+      postingPages.push(packPostingPage(pendingPage.subarray(0, usedBytes)));
+    }
     pendingPage = new Uint8Array(pageBytes);
     usedBytes = 0;
   };

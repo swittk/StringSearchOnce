@@ -13,6 +13,7 @@ import {
   type PostingPageStore,
   type PostingTerm,
 } from './postingFormat';
+import { maxPostingPages } from './postingLimits';
 import { caseSensitivePostingPrefix, lowercasePostingText } from './postingText';
 
 function checkPostingQueryLength(text: string): void {
@@ -327,7 +328,7 @@ export class PostingReader {
     }
     if (m.documents > 0xffffffff || m.terms > Math.floor(lexiconLimit / 32))
       throw new Error('POSTING_MANIFEST_INVALID');
-    if (m.lexiconPages > 65536 || m.postingPages > 1000000)
+    if (m.lexiconPages > 65536 || m.postingPages > maxPostingPages)
       throw new Error('POSTING_MANIFEST_INVALID');
     if (m.idsPerPage < 1 || m.idsPerPage > 4096)
       throw new Error('POSTING_MANIFEST_INVALID');
@@ -555,10 +556,10 @@ export class PostingReader {
     );
     return lists.length === 1 ? lists[0]! : new UnionCursor(lists, tick);
   }
-  private async intersection(
+  private intersection(
     groups: readonly (readonly PostingTerm[])[],
     tick: () => void
-  ): Promise<Cursor> {
+  ): Cursor {
     // Sort by the posting lengths once so the smallest group drives the intersection.
     const groupsBySize: { entries: readonly PostingTerm[]; size: number }[] = [];
     for (const entries of groups) {
@@ -568,12 +569,10 @@ export class PostingReader {
       groupsBySize.push({ entries, size });
     }
     groupsBySize.sort((a, b) => a.size - b.size);
-    const cursor = new IntersectionCursor(
+    return new IntersectionCursor(
       groupsBySize.map(({ entries }) => this.cursor(entries, tick)),
       tick
     );
-    await cursor.seek(0);
-    return cursor;
   }
   private async objectIds(ordinals: readonly number[]): Promise<string[]> {
     const pages = new Map<number, readonly string[]>();
@@ -806,15 +805,17 @@ export class PostingReader {
         const key = postingNameKey(tier.kind, lookupPhrase);
         cursor = this.cursor(this.prefix(key, includeCaseSensitiveKeys), tick);
       } else if (tier.stage === 'word-prefix') {
-        cursor = await this.intersection(
-          words.map((word) => this.prefix('w|' + word, includeCaseSensitiveKeys)), tick
+        const prefixWords = words.length === 1 ? words : new Set(words);
+        cursor = this.intersection(
+          Array.from(prefixWords, (word) => this.prefix('w|' + word, includeCaseSensitiveKeys)), tick
         );
       } else {
-        cursor = await this.intersection(
+        cursor = this.intersection(
           Array.from(gramTerms, (term) => this.exact(term, includeCaseSensitiveKeys)), tick
         );
       }
-      if (after && tierNumber === after.tier) await cursor.seek(after.ordinal + 1);
+      const initialOrdinal = after && tierNumber === after.tier ? after.ordinal + 1 : 0;
+      if (cursor.peek() < initialOrdinal) await cursor.seek(initialOrdinal);
       while (cursor.peek() !== Infinity && result.results.length < resultLimit) {
         const candidates: number[] = [];
         const size = Math.min(batchSize, resultLimit - result.results.length);
@@ -843,7 +844,7 @@ export class PostingReader {
             fetchedById.set(id, object);
           }
           const allowed = options.filterCandidates
-            ? new Set((await options.filterCandidates(fetched)).map(options.getId))
+            ? new Set((await options.filterCandidates(fetched)).map((object) => options.getId(object)))
             : allowedIds;
           for (const [index, ordinal] of missing.entries()) {
             const id = ids[index]!;

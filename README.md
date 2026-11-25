@@ -74,10 +74,15 @@ A build creates an immutable manifest and three groups of compressed
 | postings | Sorted integer ordinals encoded as delta-varints |
 | ids | Mapping from ordinals to the original IDs |
 
-Pages use raw DEFLATE compression. Build and store all pages before making the
-manifest visible to readers. Use a unique generation identifier. A
-`PostingReader` stays bound to one generation. The reader opens the bounded
-lexicon once, then retrieves posting/ID pages and decodes chunks lazily.
+Pages use raw DEFLATE compression. Use a unique generation identifier. Build
+and store all pages. Construct a reader for the stored generation with the
+intended reader options and call `await reader.open()` before making the
+manifest visible. The `maxLexiconBytes` setting defaults to 32 MiB and
+separately caps the decompressed lexicon and the estimated in-memory term
+directory.
+
+A `PostingReader` stays bound to one generation. It opens the bounded lexicon
+once, then retrieves posting/ID pages and decodes chunks lazily.
 Page, chunk, and ID caches have separate byte budgets; cache counters report
 cold reads and repeated decodes. The index does not cache source records or
 access decisions across searches.

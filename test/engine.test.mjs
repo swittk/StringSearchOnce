@@ -216,6 +216,15 @@ test('source verification distinguishes falsy fetched rows from missing and deni
   assert.deepEqual(result.results.map(hit => hit.object), [0, undefined]);
 });
 
+test('source ID extraction takes one argument even with a candidate filter', async () => {
+  const f = fixture([doc('a', 'Desk'), doc('b', 'Desk')]);
+  const result = await f.reader.search(f.options('desk', {
+    getId: (row, prefix = '') => prefix + row.id,
+    filterCandidates: async rows => rows.filter(row => row.id === 'b'),
+  }));
+  assert.deepEqual(ids(result), ['b']);
+});
+
 test('signed keyset pages fill across rank tiers and reject changed scope, query, and generation', async () => {
   const f = fixture();
   const options = f.options('café', { limit: 2, scopeKey: 'demo:catalog:visible', signingKey: 'synthetic-test-signing-key' });
@@ -272,6 +281,29 @@ test('rank/ID continuation need not refer to an object in the snapshot', async (
     stage: 'exact', kind: 'title', id: 'ab',
   });
   assert.deepEqual(ids(result), oracle(documents,'café').slice(1));
+});
+
+test('continuation intersects only the suffix of the saved tier', async () => {
+  for (const [stage, prefix] of [['word-prefix', 'Oak '], ['substring', 'Oak X']]) {
+    const input = Array.from({ length: 200 }, (_, i) =>
+      doc(String(i).padStart(4, '0'), prefix + (i % 2 === 0 ? 'desk' : 'lamp'))
+    );
+    input.push(doc('0200', prefix + 'desk ' + prefix + 'lamp'));
+    const f = fixture(input);
+    const result = await f.reader.searchAfterRank(f.options('desk lamp', {
+      limit: 1, maxCursorSteps: 20,
+    }), { stage, kind: 'all', id: '0199' });
+    assert.deepEqual(ids(result), ['0200'], stage);
+    assert.equal(result.results[0].stage, stage);
+  }
+});
+
+test('repeated query words share their word-prefix lookup work', async () => {
+  const f = fixture([doc('a', 'Oak desktop'), doc('b', 'Oak desks')]);
+  const single = await f.reader.search(f.options('desk'));
+  const repeated = await f.reader.search(f.options('desk desk desk'));
+  assert.deepEqual(ids(repeated), ['a', 'b']);
+  assert.equal(repeated.cursorSteps, single.cursorSteps);
 });
 
 test('query entrypoints reject oversized blanks before reading index pages', async () => {
