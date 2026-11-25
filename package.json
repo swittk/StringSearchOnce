@@ -25,7 +25,7 @@
     "url": "git+https://github.com/swittk/StringSearchOnce.git"
   },
   "keywords": ["substring", "search", "inverted-index", "postings", "compression", "unicode"],
-  "engines": { "node": ">=22" },
+  "engines": { "node": "^18.18.0 || >=20.5.0" },
   "scripts": {
     "build": "tsup",
     "typecheck": "tsc --noEmit",
@@ -35,7 +35,7 @@
     "prepack": "npm run build"
   },
   "devDependencies": {
-    "@types/node": "22.20.0",
+    "@types/node": "18.18.14",
     "tsup": "8.5.0",
     "typescript": "5.9.3"
   }

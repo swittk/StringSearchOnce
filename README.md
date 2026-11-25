@@ -10,8 +10,9 @@ database driver, durable queue, or distributed indexing system.
 
 ## Use
 
-Node.js 22 or later. The initial implementation is under review; no npm
-release has been made yet. Build and test this branch with:
+Use Node.js 18.18.0 or later on the 18.x line, or Node.js 20.5.0 or later.
+The initial implementation is under review and has yet to be released on npm.
+Build and test this branch with:
 
 ```sh
 npm ci
