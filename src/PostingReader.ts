@@ -1,4 +1,3 @@
-import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import {
   comparePostingIds,
   decodePostingIds,
@@ -13,6 +12,7 @@ import {
   type PostingPageStore,
   type PostingTerm,
 } from './postingFormat';
+import { postingCursorDigest, readPostingCursor, writePostingCursor } from './postingCursor';
 import { maxPostingPages } from './postingLimits';
 import { caseSensitivePostingPrefix, lowercasePostingText } from './postingText';
 
@@ -25,6 +25,7 @@ function checkPostingQueryLength(text: string): void {
 /** The index supplies rank tiers; no source-object relevance sort runs during search. */
 export type PostingStage = 'exact' | 'prefix' | 'word-prefix' | 'substring';
 export type PostingTier = { stage: PostingStage; kind: string | 'all' };
+export type PostingRankBoundary = PostingTier & { id: string };
 /** Kind order is used by the frozen reader, live overlay and final merge. */
 export function createPostingKindRanks(kinds: readonly string[]): Map<string, number> {
   const ranks = new Map<string, number>();
@@ -112,6 +113,23 @@ export type PostingSearchOptions<T> = {
   maxSourceCandidates?: number;
   maxCursorSteps?: number;
 };
+
+function postingQueryLimits({
+  limit = 10,
+  batchSize = 20,
+  maxSourceCandidates = 10000,
+  maxCursorSteps = 1000000,
+}: Pick<PostingSearchOptions<unknown>, 'limit' | 'batchSize' | 'maxSourceCandidates' | 'maxCursorSteps'>) {
+  const limits = [limit, batchSize, maxSourceCandidates, maxCursorSteps] as const;
+  if (
+    !limits.every((n) => Number.isSafeInteger(n) && n > 0) ||
+    batchSize > 100 ||
+    limit > maxSourceCandidates
+  )
+    throw new Error('POSTING_QUERY_LIMITS');
+  return limits;
+}
+
 /** The signed cursor binds the ordering, query and every caller-specific source filter. */
 export type PostingPageOptions<T> = PostingSearchOptions<T> & {
   cursor?: string;
@@ -121,10 +139,29 @@ export type PostingPageOptions<T> = PostingSearchOptions<T> & {
   signingKey: string | Uint8Array;
 };
 export type PostingPageResult<T> = PostingSearchResult<T> & { nextCursor?: string };
+export type PostingCompositePageOptions<T> = PostingPageOptions<T> & {
+  /**
+   * Return up to limit distinct results in rank/ID order, strictly after the
+   * boundary. Apply the same current-record, ranking and eligibility policies
+   * as the readers. A shorter prefix signals exhaustion.
+   */
+  readLive?: (
+    after: PostingRankBoundary | undefined, limit: number
+  ) => Promise<readonly PostingHit<T>[]>;
+};
+export type PostingCompositePageResult<T> = Omit<PostingPageResult<T>, 'generation'> & {
+  /** Number of ranked rows returned by readLive, before merge. Other counters sum the readers. */
+  liveRows: number;
+};
+type PostingHit<T> = { object: T; stage: PostingStage; kind: string };
+type PostingRankedPrefix<T> = {
+  results: readonly PostingHit<T>[];
+  rankAt: (index: number) => number;
+};
 export type PostingSearchResult<T> = {
   generation: string;
   coverage: 'substring' | 'prefix-only';
-  results: Array<{ object: T; stage: PostingStage; kind: string }>;
+  results: PostingHit<T>[];
   sourceReads: number;
   sourceCandidates: number;
   sourceRows: number;
@@ -138,6 +175,44 @@ export type PostingReaderOptions = {
   maxLexiconBytes?: number;
   maxMatchedTerms?: number;
 };
+
+function mergePostingPrefixes<T>(
+  streams: readonly PostingRankedPrefix<T>[],
+  getId: (object: T) => string,
+  limit: number
+): PostingHit<T>[] {
+  const heads = streams.map(({ results, rankAt }) => ({ results, rankAt, index: -1, rank: Infinity, id: '' }));
+  const advance = (head: (typeof heads)[number]) => {
+    const hit = head.results[++head.index];
+    head.rank = hit ? head.rankAt(head.index) : Infinity;
+    head.id = hit ? getId(hit.object) : '';
+  };
+  for (const head of heads) advance(head);
+  const results: PostingHit<T>[] = [];
+  const emitted = new Set<string>();
+  while (results.length < limit) {
+    let first: (typeof heads)[number] | undefined;
+    for (const head of heads) {
+      if (head.rank === Infinity) continue;
+      if (
+        !first || head.rank < first.rank ||
+        (head.rank === first.rank && comparePostingIds(head.id, first.id) < 0)
+      )
+        first = head;
+    }
+    if (!first) break;
+    const { rank, id } = first;
+    // A source edit between reads can put an already emitted ID in a later tier.
+    if (!emitted.has(id)) {
+      emitted.add(id);
+      results.push(first.results[first.index]!);
+    }
+    for (const head of heads) {
+      if (head.rank === rank && head.id === id) advance(head);
+    }
+  }
+  return results;
+}
 
 /** One byte-bounded cache per generation. No source objects, session results or ACL decisions live here. */
 class ByteCache<T> {
@@ -605,13 +680,7 @@ export class PostingReader {
       const idPageBatchSize = 4;
       for (let start = 0; start < missing.length; start += idPageBatchSize) {
         const batch = missing.slice(start, start + idPageBatchSize);
-        const unread: number[] = [];
-        for (const number of batch) {
-          const key = 'ids:' + number;
-          if (!this.idCache.has(String(number)) && !this.pageCache.has(key) && !this.pendingPages.has(key))
-            unread.push(number);
-        }
-        if (unread.length > 1) this.startPageReads('ids', unread);
+        this.prefetchIdPages(batch);
         await Promise.all(batch.map(async (number) => {
           pages.set(number, await this.readIdPage(number));
         }));
@@ -624,6 +693,16 @@ export class PostingReader {
         ]!
     );
   }
+  private prefetchIdPages(numbers: readonly number[]): void {
+    const unread: number[] = [];
+    for (const number of numbers) {
+      const key = 'ids:' + number;
+      if (!this.idCache.has(String(number)) && !this.pageCache.has(key) && !this.pendingPages.has(key))
+        unread.push(number);
+    }
+    if (unread.length > 1) this.startPageReads('ids', unread);
+  }
+
   private async readIdPage(number: number): Promise<readonly string[]> {
     const key = String(number);
     const hit = this.idCache.get(key);
@@ -646,6 +725,24 @@ export class PostingReader {
     this.idCache.put(key, raw, size);
     return raw;
   }
+  /** Enumerate immutable, ascending IDs in batches using only ID pages. */
+  async *idBatches(): AsyncGenerator<readonly string[]> {
+    const readSize = 8;
+    let previous = '';
+    for (let start = 0; start < this.manifest.idPages; start += readSize) {
+      const numbers: number[] = [];
+      const end = Math.min(start + readSize, this.manifest.idPages);
+      for (let page = start; page < end; page++) numbers.push(page);
+      this.prefetchIdPages(numbers);
+      const batches = await Promise.all(numbers.map((number) => this.readIdPage(number)));
+      for (const ids of batches) {
+        if (ids[0]! <= previous) throw new Error('POSTING_OBJECT_IDS_INVALID');
+        previous = ids[ids.length - 1]!;
+        yield ids;
+      }
+    }
+  }
+
   /**
    * Return successive pages in tier/objectId order. A token is scoped to this immutable
    * generation, search text and caller's source query; it cannot be edited to skip rows.
@@ -665,70 +762,103 @@ export class PostingReader {
       throw new Error('POSTING_PAGE_OPTIONS_INVALID');
     if (signingKey.length < 16)
       throw new Error('POSTING_PAGE_OPTIONS_INVALID');
-    const digest = createHash('sha256')
-      .update(
-        JSON.stringify([
-          this.manifest.generation,
-          this.manifest.kinds,
-          request.text.normalize('NFC'),
-          Boolean(request.caseSensitive),
-          scopeKey,
-        ])
-      )
-      .digest('hex');
+    const digest = postingCursorDigest([
+      this.manifest.generation, this.manifest.kinds, request.text.normalize('NFC'),
+      Boolean(request.caseSensitive), scopeKey,
+    ]);
     let after: { tier: number; ordinal: number } | undefined;
-    const sign = (payload: string) => createHmac('sha256', signingKey).update(payload).digest();
     if (cursor) {
-      if (cursor.length > 4096) throw new Error('POSTING_CURSOR_INVALID');
-      const pieces = cursor.split('.');
-      if (pieces.length !== 2) throw new Error('POSTING_CURSOR_INVALID');
-      const encoded = pieces[0]!,
-        mac = pieces[1]!;
-      const correct = sign(encoded);
-      let provided: Buffer;
-      try {
-        provided = Buffer.from(mac, 'base64url');
-      } catch {
-        throw new Error('POSTING_CURSOR_INVALID');
-      }
+      const [tier, ordinal] = readPostingCursor(cursor, signingKey, digest, this.manifest.kinds.length * 2 + 2);
       if (
-        provided.byteLength !== correct.byteLength ||
-        !timingSafeEqual(
-          new Uint8Array(provided.buffer, provided.byteOffset, provided.byteLength),
-          new Uint8Array(correct.buffer, correct.byteOffset, correct.byteLength)
-        )
+        typeof ordinal !== 'number' || !Number.isSafeInteger(ordinal) ||
+        ordinal < 0 || ordinal >= this.manifest.documents
       )
-        throw new Error('POSTING_CURSOR_INVALID');
-      let decoded: unknown;
-      try {
-        decoded = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
-      } catch {
-        throw new Error('POSTING_CURSOR_INVALID');
-      }
-      if (!Array.isArray(decoded) || decoded.length !== 4)
-        throw new Error('POSTING_CURSOR_INVALID');
-      const [version, cursorDigest, tier, ordinal] = decoded;
-      if (version !== 1 || cursorDigest !== digest)
-        throw new Error('POSTING_CURSOR_INVALID');
-      if (!Number.isSafeInteger(tier) || tier < 0)
-        throw new Error('POSTING_CURSOR_INVALID');
-      if (!Number.isSafeInteger(ordinal) || ordinal < 0 || ordinal >= this.manifest.documents)
         throw new Error('POSTING_CURSOR_INVALID');
       after = { tier, ordinal };
-      if (after.tier >= this.manifest.kinds.length * 2 + 2)
-        throw new Error('POSTING_CURSOR_INVALID');
     }
     // One extra accepted row proves there really is another page. Never count a
     // denied row or a stale-name false positive as proof that more results exist.
     const { result, positions } = await this.searchRun(request, after, true);
     if (result.results.length <= limit) return result;
     const last = positions[limit - 1]!;
-    const payload = Buffer.from(JSON.stringify([1, digest, last.tier, last.ordinal])).toString(
-      'base64url'
-    );
-    const nextCursor = payload + '.' + sign(payload).toString('base64url');
+    const nextCursor = writePostingCursor(signingKey, digest, last.tier, last.ordinal);
     return { ...result, results: result.results.slice(0, limit), nextCursor };
   }
+
+  /** Return a signed page across readers with the same ordered name kinds. */
+  static async searchCompositePage<T>(
+    readers: readonly [PostingReader, ...PostingReader[]],
+    options: PostingCompositePageOptions<T>
+  ): Promise<PostingCompositePageResult<T>> {
+    checkPostingQueryLength(options.text);
+    const { signingKey, scopeKey, cursor, limit = 10, readLive } = options;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100 || !scopeKey || signingKey.length < 16)
+      throw new Error('POSTING_PAGE_OPTIONS_INVALID');
+    const limits = postingQueryLimits(options);
+    const { kinds } = readers[0].manifest;
+    const generations: string[] = [];
+    for (const { manifest } of readers) {
+      if (manifest.kinds.length !== kinds.length || manifest.kinds.some((kind, index) => kind !== kinds[index]))
+        throw new Error('POSTING_COMPOSITE_KINDS_MISMATCH');
+      generations.push(manifest.generation);
+    }
+    const digest = postingCursorDigest([
+      generations, kinds, options.text.normalize('NFC'), Boolean(options.caseSensitive), scopeKey, Boolean(readLive),
+    ]);
+    const kindRanks = createPostingKindRanks(kinds);
+    let after: PostingRankBoundary | undefined;
+    let afterTier = 0;
+    if (cursor) {
+      const [tier, id] = readPostingCursor(cursor, signingKey, digest, kinds.length * 2 + 2);
+      if (typeof id !== 'string' || !/^[\x21-\x7e]{1,128}$/.test(id))
+        throw new Error('POSTING_CURSOR_INVALID');
+      const { stage, kind } = createPostingTiers(kinds)[tier]!;
+      after = { stage, kind, id };
+      afterTier = tier;
+    }
+    const nonblank = Boolean(options.text.trim());
+    const snapshotReads = readers.map(async (reader) => {
+      const position = after && nonblank ? await reader.rankPosition(afterTier, after.id) : undefined;
+      return reader.searchRun(options, position, true, limits);
+    });
+    const liveRead = nonblank && readLive ? Promise.resolve().then(() => readLive(after, limit + 1)) : [];
+    const [snapshots, live] = await Promise.all([Promise.all(snapshotReads), liveRead]).catch(async (error: unknown) => {
+      // The request owns its callbacks until settlement, including when a stream fails.
+      await Promise.allSettled([...snapshotReads, liveRead]);
+      throw error;
+    });
+    const page: PostingCompositePageResult<T> = {
+      results: [],
+      coverage: snapshots[0]!.result.coverage,
+      sourceReads: 0,
+      sourceCandidates: 0,
+      sourceRows: 0,
+      cursorSteps: 0,
+      liveRows: live.length,
+    };
+    const streams: PostingRankedPrefix<T>[] = [];
+    for (const { result, positions } of snapshots) {
+      page.sourceReads += result.sourceReads;
+      page.sourceCandidates += result.sourceCandidates;
+      page.sourceRows += result.sourceRows;
+      page.cursorSteps += result.cursorSteps;
+      streams.push({ results: result.results, rankAt: (index) => positions[index]!.tier });
+    }
+    if (live.length)
+      streams.push({ results: live, rankAt: (index) => postingTierRank(live[index]!, kindRanks)! });
+    // A full stream prefix alone contains limit+1 distinct IDs. No omitted row
+    // can precede the merged lookahead, even when every stream overlaps.
+    page.results = mergePostingPrefixes(streams, options.getId, limit + 1);
+    if (page.results.length > limit) {
+      page.results.pop();
+      const last = page.results[limit - 1]!;
+      page.nextCursor = writePostingCursor(
+        signingKey, digest, postingTierRank(last, kindRanks)!, options.getId(last.object)
+      );
+    }
+    return page;
+  }
+
   /** Search starts at the beginning when no paging cursor was provided. */
   async search<T>(options: PostingSearchOptions<T>): Promise<PostingSearchResult<T>> {
     checkPostingQueryLength(options.text);
@@ -737,11 +867,11 @@ export class PostingReader {
   /**
    * Continue from a global rank/ID pair. The ID may belong to a newer live
    * overlay and therefore not exist in this snapshot.
-   * The composite live search owns the signed client cursor and permission scope.
+   * Use searchCompositePage to sign and merge pages from several streams.
    */
   async searchAfterRank<T>(
     options: PostingSearchOptions<T>,
-    last?: { stage: PostingStage; kind: string; id: string }
+    last?: PostingRankBoundary
   ): Promise<PostingSearchResult<T>> {
     if (!last) return this.search(options);
     checkPostingQueryLength(options.text);
@@ -749,42 +879,40 @@ export class PostingReader {
     if (tier === undefined || !/^[\x21-\x7e]{1,128}$/.test(last.id))
       throw new Error('POSTING_RANK_CURSOR_INVALID');
     if (!options.text.trim()) return (await this.searchRun(options)).result;
+    return (await this.searchRun(options, await this.rankPosition(tier, last.id))).result;
+  }
+  private async rankPosition(tier: number, lastId: string): Promise<{ tier: number; ordinal: number }> {
     await this.open();
     // Search the sorted ordinal->ID mapping. The continuation object may have
     // been inserted after the frozen snapshot, so equality is not required.
+    const { idsPerPage } = this.manifest;
+    let loadedPage = -1;
+    let ids: readonly string[] = [];
     let low = 0,
       high = this.manifest.documents;
     while (low < high) {
-      const mid = (low + high) >>> 1;
-      const [id] = await this.objectIds([mid]);
-      if (id! <= last.id) low = mid + 1;
+      const mid = Math.floor((low + high) / 2);
+      const page = Math.floor(mid / idsPerPage);
+      if (page !== loadedPage) {
+        ids = await this.readIdPage(page);
+        loadedPage = page;
+      }
+      if (ids[mid % idsPerPage]! <= lastId) low = mid + 1;
       else high = mid;
     }
-    return (await this.searchRun(options, { tier, ordinal: low - 1 })).result;
+    return { tier, ordinal: low - 1 };
   }
   /** Find the ranked prefix of authorized matches, without fetching/sorting the entire candidate set. */
   private async searchRun<T>(
     options: PostingSearchOptions<T>,
     after?: { tier: number; ordinal: number },
-    includeLookahead = false
+    includeLookahead = false,
+    limits = postingQueryLimits(options)
   ): Promise<{
     result: PostingSearchResult<T>;
     positions: Array<{ tier: number; ordinal: number }>;
   }> {
-    const {
-      limit = 10,
-      batchSize = 20,
-      maxSourceCandidates = 10000,
-      maxCursorSteps = 1000000,
-    } = options;
-    if (
-      ![limit, batchSize, maxSourceCandidates, maxCursorSteps].every(
-        (n) => Number.isSafeInteger(n) && n > 0
-      ) ||
-      batchSize > 100 ||
-      limit > maxSourceCandidates
-    )
-      throw new Error('POSTING_QUERY_LIMITS');
+    const [limit, batchSize, maxSourceCandidates, maxCursorSteps] = limits;
     const resultLimit = includeLookahead ? limit + 1 : limit;
     const matchingPhrase = options.caseSensitive
       ? options.text.normalize('NFC').trim()

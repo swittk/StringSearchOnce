@@ -25,10 +25,18 @@ const reader = new PostingReader(built.manifest,{
     return new Map(pages.map(page=>[page,built.pages.get(kind)[page]]));
   }
 });
-const result = await reader.search({
+const search = {
   text:'desk',fetchSources:async()=>rows,getId:row=>row.id,getNames:row=>row.names,
-});
+};
+const result = await reader.search(search);
 if (result.results[0]?.object.id !== '01') throw Error('Bad consumer result');
+const allIds = [];
+for await (const ids of reader.idBatches()) allIds.push(...ids);
+if (allIds.length !== 1 || allIds[0] !== '01') throw Error('Bad ID sequence');
+const page = await PostingReader.searchCompositePage([reader], {
+  ...search, scopeKey:'catalog', signingKey:'example-server-signing-key',
+});
+if (page.results[0]?.object.id !== '01') throw Error('Bad composite result');
 `;
     const esm = `import {buildPostingGenerationInWorker,PostingReader} from 'stringsearchonce';\n` + body;
     writeFileSync(join(dir,'esm.mjs'), esm);
@@ -52,9 +60,15 @@ const built = buildPostingGeneration(rows,{generation:'test',kinds:['title']});
 const store: PostingPageStore = {async readPages(_generation,kind,pages) {
   return new Map(pages.map(page=>[page,built.pages.get(kind)![page]!]));
 }};
-new PostingReader(built.manifest,store);
+const reader = new PostingReader(built.manifest,store);
+const batches: AsyncIterable<readonly string[]> = reader.idBatches();
+const page: Promise<PostingCompositePageResult<PostingDocument>> = PostingReader.searchCompositePage([reader],{
+  text:'desk',fetchSources:async()=>rows,getId:row=>row.id,getNames:row=>row.names,
+  scopeKey:'catalog',signingKey:'example-server-signing-key',
+  readLive:async(after,limit)=>after?.id === '01' || !limit ? [] : [{object:rows[0],stage:'exact',kind:'title'}],
+});
 `;
-    const imports = `import {buildPostingGeneration,PostingReader,type PostingDocument,type PostingPageStore} from 'stringsearchonce';
+    const imports = `import {buildPostingGeneration,PostingReader,type PostingDocument,type PostingPageStore,type PostingCompositePageResult} from 'stringsearchonce';
 `;
     writeFileSync(join(dir,'typed.mts'), imports + typed);
     writeFileSync(join(dir,'typed.cts'), imports + typed);
