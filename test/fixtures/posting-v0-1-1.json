@@ -1,0 +1,394 @@
+{
+  "createdBy": "stringsearchonce@0.1.1",
+  "artifactSha256": "f40d9deb57669afa43727754ca718abba13d87db088416fd761eb03a30f816c5",
+  "description": "Frozen synthetic format-0 index. Includes rank tiers, multiple name kinds, cross-field words, composed/decomposed accents, Greek sigma, Thai, symbols and case-sensitive normalization.",
+  "manifest": {
+    "format": 0,
+    "generation": "compatibility-v0-1-1",
+    "documents": 15,
+    "terms": 107,
+    "kinds": [
+      "primary",
+      "alias"
+    ],
+    "lexiconPages": 1,
+    "postingPages": 1,
+    "idPages": 4,
+    "idsPerPage": 4
+  },
+  "pages": {
+    "lexicon": [
+      "fVcxbtwwEPzKQTULrpYUybecr9Cd5TsDF9vQxZADqAkM2x9InzpAAAOp3KVIa9hf8BPyhOAkk0ty6dQ7XC13Z2ap5bLawvj3+7eflajFcimFFLWohRF2tVqJZbWtx0VbCZhitQABxzjFeh/DKWaEodicdg6rKWyjtO3ax/QUAwEUO/PlNFM5SmiK7Suhp5gVSighBa7EUgqYqwMlQBG494kA2cXaz74CmEtwwoXgugvBhtW33oegYT3ZtJXAOWgFChQqSrvZ+YJqYAWdXoZOIyuoW4SgYt/s2pBWs7RduEptCj3qLkLYlsKHkNrx1KGFCKxLZ39++KNYszluiTqq8NlduC5qxp1d6zmATUICJQupzp8ffB1qbvqRKxji+yufTWGardSu/XXgtGVzuNyGoGMTvNr572iZfEeXGtBvfNGaj7TvPMe0mThm4qOHLsiHy/k6sKHher4JWm9mBqKgPj0/3IS8qtDHl8fX2wCYhQtSABHi5XcEsAXA6+3LowcYWQS83gVAXQLcvd4HgCoB7l9+B0CpyLenr29Pv3wbzDzjRjQR4Nfb00MAOAY4+l5gr5WZMeK4aIN9WMhGgOOiDwOyNTvbki9ZzBSHYxtJzqpMcji2xHSb6sZx3eDYEgVdblY4rkn7jleyJpm43K5w3JDBO83K3JAxO5OpCMcNOYOzmTPgeEoKdLkCcexol4GUrKwuWheS37gjpwSJhYZ1JDyQip3f0mRBNoXzu2RlgjTsejvamiAt6/p5JFGQjmkUxz2ZEACkC/R9C6Y17ckv4H0Txi27IisGMNlChkK+njYg1DXrUU/LCmpui0fAgc7nxojjgTYh1IaFr2mLQu3YbW5ImYAyM0CcDI78BxCYfeBkYeRygFjExDYFqEuYu9ipAE0Jcx87KqArYGY7iwwLFGSOhbNj9YTIfOfipGr35+3hpDpayI40pJgKImgkRVAq1eLFSXXVn39q+y8858xCKeRH0Mh5QGWPswS93l93iyx79l5L8JvYP0HZ1JkyaPR4lP+53LaPbUMzSSTgRL+6zvWbYPvu0LX9JvMMnT20kyM3aS+0ThmeYGcezyyMOKbZykxOcbbpbIEm8Jl37xehIy6l3+AZ8v6qbuT05JGhhwPnRZOtpGEiA4WznTRks2+yrTQkA2+yrTQkXG9sHk050LicA0M6eP/yocEPIzXJgzLvHPLpGpVOd/hopIbZz1CYozHpHIfkrxGMjcpZ/QM="
+    ],
+    "postings": [
+      "TYxBDsAgDMNwQaSdUP//3ImOaVNuTmJhcgYNSBHYYIgwkSkYpFe3nonFWYoprC+uX+aU6bNtWXi5RDqv49Rlsf67K6PVKRfeN2i2CmwiCnED"
+    ],
+    "ids": [
+      "i1YyMFTSUTIwAhHGIMJEKRYA",
+      "i1YyMFXSUTIwAxHmIMJCKRYA",
+      "i1YysFTSUTI0ABGGIMJIKRYA",
+      "i1YyNFbSUTI0ARGmSrEA"
+    ]
+  },
+  "documents": [
+    {
+      "id": "01",
+      "names": [
+        {
+          "kind": "primary",
+          "text": "Alpha"
+        }
+      ]
+    },
+    {
+      "id": "02",
+      "names": [
+        {
+          "kind": "primary",
+          "text": "Alphabet"
+        }
+      ]
+    },
+    {
+      "id": "03",
+      "names": [
+        {
+          "kind": "primary",
+          "text": "Blue Alpha"
+        }
+      ]
+    },
+    {
+      "id": "04",
+      "names": [
+        {
+          "kind": "primary",
+          "text": "Xalpha"
+        }
+      ]
+    },
+    {
+      "id": "05",
+      "names": [
+        {
+          "kind": "primary",
+          "text": "Café"
+        }
+      ]
+    },
+    {
+      "id": "06",
+      "names": [
+        {
+          "kind": "primary",
+          "text": "CAFÉ"
+        }
+      ]
+    },
+    {
+      "id": "07",
+      "names": [
+        {
+          "kind": "primary",
+          "text": "กาง"
+        }
+      ]
+    },
+    {
+      "id": "08",
+      "names": [
+        {
+          "kind": "primary",
+          "text": "🔬 research"
+        }
+      ]
+    },
+    {
+      "id": "09",
+      "names": [
+        {
+          "kind": "primary",
+          "text": "Research 🔬"
+        }
+      ]
+    },
+    {
+      "id": "10",
+      "names": [
+        {
+          "kind": "primary",
+          "text": "cat"
+        },
+        {
+          "kind": "alias",
+          "text": "dog"
+        }
+      ]
+    },
+    {
+      "id": "11",
+      "names": [
+        {
+          "kind": "primary",
+          "text": "σίσυφος"
+        }
+      ]
+    },
+    {
+      "id": "12",
+      "names": [
+        {
+          "kind": "primary",
+          "text": "ΣΊΣΥΦΟΣ"
+        }
+      ]
+    },
+    {
+      "id": "13",
+      "names": [
+        {
+          "kind": "primary",
+          "text": "İx"
+        }
+      ]
+    },
+    {
+      "id": "14",
+      "names": [
+        {
+          "kind": "primary",
+          "text": "i̇x"
+        }
+      ]
+    },
+    {
+      "id": "15",
+      "names": [
+        {
+          "kind": "primary",
+          "text": "Green"
+        },
+        {
+          "kind": "alias",
+          "text": "Alpha"
+        }
+      ]
+    }
+  ],
+  "queries": [
+    {
+      "text": "alpha",
+      "caseSensitive": false,
+      "hits": [
+        {
+          "id": "01",
+          "stage": "exact",
+          "kind": "primary"
+        },
+        {
+          "id": "15",
+          "stage": "exact",
+          "kind": "alias"
+        },
+        {
+          "id": "02",
+          "stage": "prefix",
+          "kind": "primary"
+        },
+        {
+          "id": "03",
+          "stage": "word-prefix",
+          "kind": "all"
+        },
+        {
+          "id": "04",
+          "stage": "substring",
+          "kind": "all"
+        }
+      ]
+    },
+    {
+      "text": "Alpha",
+      "caseSensitive": true,
+      "hits": [
+        {
+          "id": "01",
+          "stage": "exact",
+          "kind": "primary"
+        },
+        {
+          "id": "15",
+          "stage": "exact",
+          "kind": "alias"
+        },
+        {
+          "id": "02",
+          "stage": "prefix",
+          "kind": "primary"
+        },
+        {
+          "id": "03",
+          "stage": "word-prefix",
+          "kind": "all"
+        }
+      ]
+    },
+    {
+      "text": "alpha",
+      "caseSensitive": true,
+      "hits": [
+        {
+          "id": "04",
+          "stage": "substring",
+          "kind": "all"
+        }
+      ]
+    },
+    {
+      "text": "café",
+      "caseSensitive": false,
+      "hits": [
+        {
+          "id": "05",
+          "stage": "exact",
+          "kind": "primary"
+        },
+        {
+          "id": "06",
+          "stage": "exact",
+          "kind": "primary"
+        }
+      ]
+    },
+    {
+      "text": "café",
+      "caseSensitive": false,
+      "hits": [
+        {
+          "id": "05",
+          "stage": "exact",
+          "kind": "primary"
+        },
+        {
+          "id": "06",
+          "stage": "exact",
+          "kind": "primary"
+        }
+      ]
+    },
+    {
+      "text": "Café",
+      "caseSensitive": true,
+      "hits": [
+        {
+          "id": "05",
+          "stage": "exact",
+          "kind": "primary"
+        }
+      ]
+    },
+    {
+      "text": "กา",
+      "caseSensitive": false,
+      "hits": [
+        {
+          "id": "07",
+          "stage": "prefix",
+          "kind": "primary"
+        }
+      ]
+    },
+    {
+      "text": "ก",
+      "caseSensitive": false,
+      "hits": [
+        {
+          "id": "07",
+          "stage": "prefix",
+          "kind": "primary"
+        }
+      ]
+    },
+    {
+      "text": "🔬",
+      "caseSensitive": false,
+      "hits": [
+        {
+          "id": "08",
+          "stage": "prefix",
+          "kind": "primary"
+        },
+        {
+          "id": "09",
+          "stage": "word-prefix",
+          "kind": "all"
+        }
+      ]
+    },
+    {
+      "text": "cat dog",
+      "caseSensitive": false,
+      "hits": [
+        {
+          "id": "10",
+          "stage": "word-prefix",
+          "kind": "all"
+        }
+      ]
+    },
+    {
+      "text": "Σίσυφος",
+      "caseSensitive": false,
+      "hits": [
+        {
+          "id": "11",
+          "stage": "exact",
+          "kind": "primary"
+        },
+        {
+          "id": "12",
+          "stage": "exact",
+          "kind": "primary"
+        }
+      ]
+    },
+    {
+      "text": "ΣΊΣΥΦΟΣ",
+      "caseSensitive": true,
+      "hits": [
+        {
+          "id": "12",
+          "stage": "exact",
+          "kind": "primary"
+        }
+      ]
+    },
+    {
+      "text": "İ",
+      "caseSensitive": true,
+      "hits": [
+        {
+          "id": "13",
+          "stage": "prefix",
+          "kind": "primary"
+        }
+      ]
+    },
+    {
+      "text": "i̇x",
+      "caseSensitive": true,
+      "hits": [
+        {
+          "id": "14",
+          "stage": "exact",
+          "kind": "primary"
+        }
+      ]
+    },
+    {
+      "text": "missing",
+      "caseSensitive": false,
+      "hits": []
+    }
+  ]
+}

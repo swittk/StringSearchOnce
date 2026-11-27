@@ -1,6 +1,13 @@
 import { deflateRawSync, inflateRawSync } from 'node:zlib';
 import { lowercasePostingText } from './postingText';
 
+/**
+ * Compatibility of stored posting pages and their persisted text/key semantics.
+ * Change only when existing indexes need rebuilding, independently of package
+ * releases and signed-cursor versions.
+ */
+export const POSTING_INDEX_COMPATIBILITY_VERSION = 0;
+
 /** One selected source name. The index does not inspect arbitrary object fields. */
 export type PostingName = { kind: string; text: string };
 /** A source row supplied to the offline generation builder. */
@@ -11,7 +18,7 @@ export type PostingChunk = readonly [number, number, number, number, number, num
 export type PostingTerm = readonly [string, number, readonly PostingChunk[]];
 /** A reader always binds to one immutable generation; it never mixes two builds. */
 export type PostingManifest = {
-  format: 0;
+  format: typeof POSTING_INDEX_COMPATIBILITY_VERSION;
   generation: string;
   documents: number;
   terms: number;

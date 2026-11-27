@@ -1,4 +1,5 @@
 import {
+  POSTING_INDEX_COMPATIBILITY_VERSION,
   comparePostingIds,
   encodePostingIds,
   packPostingJson,
@@ -140,7 +141,7 @@ export function buildPostingGeneration(
   }
   return {
     manifest: {
-      format: 0,
+      format: POSTING_INDEX_COMPATIBILITY_VERSION,
       generation,
       documents: rows.length,
       terms: entries.length,

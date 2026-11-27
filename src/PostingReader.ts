@@ -1,4 +1,5 @@
 import {
+  POSTING_INDEX_COMPATIBILITY_VERSION,
   comparePostingIds,
   decodePostingIds,
   foldPostingText,
@@ -109,6 +110,7 @@ export type PostingSearchOptions<T> = {
   filterCandidates?: (objects: readonly T[]) => Promise<readonly T[]>;
   caseSensitive?: boolean;
   limit?: number;
+  /** Source-fetch ceiling; batches adapt to remaining demand and observed acceptance. */
   batchSize?: number;
   maxSourceCandidates?: number;
   maxCursorSteps?: number;
@@ -396,7 +398,10 @@ export class PostingReader {
       termLimit < 1
     )
       throw new Error('POSTING_READER_LIMIT_INVALID');
-    if (m.format !== 0 || typeof m.generation !== 'string' || !m.generation)
+    if (
+      m.format !== POSTING_INDEX_COMPATIBILITY_VERSION ||
+      typeof m.generation !== 'string' || !m.generation
+    )
       throw new Error('POSTING_MANIFEST_INVALID');
     if (!Array.isArray(m.kinds) || !m.kinds.length)
       throw new Error('POSTING_MANIFEST_INVALID');
@@ -936,11 +941,14 @@ export class PostingReader {
     const includeCaseSensitiveKeys =
       options.caseSensitive && this.terms.at(-1)?.startsWith(caseSensitivePostingPrefix);
     const matchingWords = options.caseSensitive ? matchingPhrase.split(/\s+/u) : words;
+    let cursorLimitError: Error | undefined;
     const tick = () => {
-      if (++result.cursorSteps > maxCursorSteps) throw new Error('POSTING_CURSOR_LIMIT');
+      if (result.cursorSteps >= maxCursorSteps)
+        throw (cursorLimitError ??= new Error('POSTING_CURSOR_LIMIT'));
+      result.cursorSteps++;
     };
-    // Retain each fetched row and its verified best rank only for this search.
-    const sourceRows = new Map<number, { object: T; rank: number } | null>();
+    // Retain source snapshots only for this search; rank each row when consumed.
+    const sourceRows = new Map<number, { object: T; rank?: number } | null>();
     const accepted = new Set<number>();
     const gramTerms = new Set<string>();
     let shortInMatchingMode = Boolean(options.caseSensitive && words.length > 1);
@@ -984,16 +992,31 @@ export class PostingReader {
         );
       }
       let nextOrdinal = after && tierNumber === after.tier ? after.ordinal + 1 : 0;
+      let examinedInTier = 0, acceptedInTier = 0;
       while (result.results.length < resultLimit && cursor.peek() !== Infinity) {
         const candidates: number[] = [];
-        const size = Math.min(batchSize, resultLimit - result.results.length);
-        while (candidates.length < size) {
-          let ordinal = cursor.peek();
-          if (ordinal < nextOrdinal) ordinal = await cursor.seek(nextOrdinal);
-          if (ordinal === Infinity) break;
-          tick();
-          nextOrdinal = ordinal + 1;
-          if (!accepted.has(ordinal) && sourceRows.get(ordinal) !== null) candidates.push(ordinal);
+        const remainingResults = resultLimit - result.results.length;
+        const expectedCandidates = acceptedInTier
+          ? Math.ceil(remainingResults * examinedInTier / acceptedInTier)
+          : examinedInTier ? batchSize : remainingResults;
+        const size = Math.min(
+          batchSize, expectedCandidates,
+          Math.max(1, maxSourceCandidates - result.sourceCandidates)
+        );
+        let deferredCursorLimit: Error | undefined;
+        try {
+          while (candidates.length < size) {
+            let ordinal = cursor.peek();
+            if (ordinal < nextOrdinal) ordinal = await cursor.seek(nextOrdinal);
+            if (ordinal === Infinity) break;
+            tick();
+            nextOrdinal = ordinal + 1;
+            if (!accepted.has(ordinal) && sourceRows.get(ordinal) !== null) candidates.push(ordinal);
+          }
+        } catch (error) {
+          if (!cursorLimitError || error !== cursorLimitError || !candidates.length) throw error;
+          // A buffered prefix can satisfy demand without the speculative tail.
+          deferredCursorLimit = cursorLimitError;
         }
         if (!candidates.length) break;
         const missing = candidates.filter((ordinal) => !sourceRows.has(ordinal));
@@ -1020,21 +1043,26 @@ export class PostingReader {
             const id = ids[index]!;
             const object = fetchedById.get(id);
             if ((object !== undefined || fetchedById.has(id)) && allowed.has(id)) {
-              const row = object as T;
-              const rank = findBestPostingRank(options.getNames(row), rankQuery);
-              sourceRows.set(ordinal, { object: row, rank });
+              sourceRows.set(ordinal, { object: object as T });
             } else {
               sourceRows.set(ordinal, null);
             }
           }
         }
         for (const ordinal of candidates) {
+          examinedInTier++;
           const source = sourceRows.get(ordinal);
-          if (!source || source.rank !== tierNumber) continue;
+          if (!source) continue;
+          if (source.rank === undefined)
+            source.rank = findBestPostingRank(options.getNames(source.object), rankQuery);
+          if (source.rank !== tierNumber) continue;
+          acceptedInTier++;
           accepted.add(ordinal);
           result.results.push({ object: source.object, stage: tier.stage, kind: tier.kind });
           positions.push({ tier: tierNumber, ordinal });
+          if (result.results.length >= resultLimit) break;
         }
+        if (deferredCursorLimit && result.results.length < resultLimit) throw deferredCursorLimit;
       }
     }
     return { result, positions };
