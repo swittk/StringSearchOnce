@@ -1,3 +1,4 @@
+import { packPostingObjectIds } from './postingObjectIds';
 import {
   POSTING_DESCRIPTOR_BYTES, POSTING_INDEX_COMPATIBILITY_VERSION,
   encodePostingDescriptors, encodePostingIds, packPostingJson, packPostingPage,
@@ -134,7 +135,7 @@ export class PostingPageBuilder {
 
   private flushIds(): void {
     if (!this.ids.length) return;
-    this.emit('ids', this.manifest.idPages++, packPostingJson(this.ids));
+    this.emit('ids', this.manifest.idPages++, packPostingObjectIds(this.ids));
     this.ids = [];
   }
   private flushPosting(): void {

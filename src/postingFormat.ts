@@ -1,5 +1,5 @@
 import { deflateRawSync, inflateRawSync } from 'node:zlib';
-import { lowercasePostingText } from './postingText';
+import { lowercasePostingText, appendPostingGrams } from './postingText';
 
 /**
  * Compatibility of stored posting pages and their persisted text/key semantics.
@@ -73,10 +73,8 @@ export function postingNameKey(kind: string, text: string): string {
 }
 /** Build all overlapping code-point grams, preserving surrogate pairs and combining marks. */
 export function postingGrams(text: string, width: number): string[] {
-  const chars = Array.from(text),
-    values = new Set<string>();
-  for (let i = 0; i + width <= chars.length; i++)
-    values.add('g' + width + '|' + chars.slice(i, i + width).join(''));
+  const values = new Set<string>();
+  appendPostingGrams(values, Array.from(text), width);
   return [...values];
 }
 /** Encode a strictly increasing list as unsigned delta-varints. */
@@ -132,7 +130,7 @@ export function unpackPostingPage(value: PostingBytes, maxBytes: number): Uint8A
     throw new Error('POSTING_PAGE_INVALID');
   return new Uint8Array(inflateRawSync(value, { maxOutputLength: maxBytes }));
 }
-/** UTF-8 JSON is used only for cold lexicon/ID pages, never for posting-list intersections. */
+/** UTF-8 JSON is used for bounded term metadata, never for posting-list intersections. */
 export function packPostingJson(value: unknown): PostingBytes {
   return packPostingPage(new TextEncoder().encode(JSON.stringify(value)));
 }

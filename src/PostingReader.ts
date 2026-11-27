@@ -1,3 +1,4 @@
+import { decodePostingObjectIds, postingObjectIdAt, type PostingObjectIdPage } from './postingObjectIds';
 import {
   POSTING_INDEX_COMPATIBILITY_VERSION, postingDescriptorAt as descriptorAt,
   comparePostingIds, decodePostingIds, foldPostingText, postingGrams,
@@ -383,7 +384,8 @@ export class PostingReader {
   private opened?: Promise<void>;
   private readonly pageCache: ByteCache<Uint8Array>;
   private readonly chunkCache: ByteCache<Uint32Array>;
-  private readonly idCache: ByteCache<readonly string[]>;
+  private readonly idCache: ByteCache<PostingObjectIdPage>;
+  private matchedTermLimitError: Error | undefined;
   private readonly pendingPages = new Map<string, Promise<Uint8Array>>();
   private readonly pendingChunks = new Map<string, Promise<Uint32Array>>();
   readonly counters = {
@@ -579,9 +581,8 @@ export class PostingReader {
       this.counters.pagesRead += pages.size;
       return pages;
     })();
-    // A 128-character ID can double through JSON escaping. Count quotes,
-    // separators and array brackets for a full page.
-    const maxBytes = kind === 'ids' ? this.manifest.idsPerPage * (128 * 2 + 3) + 1
+    // Each printable ASCII ID has one length byte and at most 128 payload bytes.
+    const maxBytes = kind === 'ids' ? this.manifest.idsPerPage * 129
       : kind === 'lexicon' || kind === 'directory' ? 262144 : 131072;
     for (const page of numbers) {
       const key = kind + ':' + page;
@@ -656,7 +657,17 @@ export class PostingReader {
   private async prefixMany(words: readonly string[], includeCaseSensitiveKeys: boolean): Promise<PostingTerm[][]> {
     const reads = words.map((word) => this.prefix('w|' + word, includeCaseSensitiveKeys));
     return Promise.all(reads).catch(async (error: unknown) => {
-      await Promise.allSettled(reads);
+      const settled = await Promise.allSettled(reads);
+      const complete: PostingTerm[][] = [];
+      for (const result of settled) {
+        if (result.status === 'fulfilled') complete.push(result.value);
+        else if (!this.matchedTermLimitError || result.reason !== this.matchedTermLimitError)
+          throw result.reason;
+      }
+      // Every true match belongs to each complete group. Discard an overflowing
+      // group entirely; the current-source ranker still verifies every word.
+      // A complete empty group proves this tier empty and must be retained.
+      if (complete.length) return complete;
       throw error;
     });
   }
@@ -675,7 +686,8 @@ export class PostingReader {
       for (let at = this.termLowerBound(page, term); at < page.length; at++) {
         const entry = page[at]!;
         if (!entry[0].startsWith(term)) return;
-        if (entries.length >= limit) throw new Error('POSTING_MATCHED_TERM_LIMIT');
+        if (entries.length >= limit)
+          throw (this.matchedTermLimitError ??= new Error('POSTING_MATCHED_TERM_LIMIT'));
         entries.push(entry);
       }
     }
@@ -707,7 +719,7 @@ export class PostingReader {
     );
   }
   private async objectIds(ordinals: readonly number[]): Promise<string[]> {
-    const pages = new Map<number, readonly string[] | undefined>();
+    const pages = new Map<number, PostingObjectIdPage | undefined>();
     let missing: number[] | undefined;
     for (const ordinal of ordinals) {
       const number = Math.floor(ordinal / this.manifest.idsPerPage);
@@ -730,13 +742,12 @@ export class PostingReader {
         }));
       }
     }
-    return ordinals.map(
-      (ordinal) =>
-        pages.get(Math.floor(ordinal / this.manifest.idsPerPage))![
-          ordinal % this.manifest.idsPerPage
-        ]!
-    );
+    return ordinals.map((ordinal) => postingObjectIdAt(
+      pages.get(Math.floor(ordinal / this.manifest.idsPerPage))!,
+      ordinal % this.manifest.idsPerPage
+    ));
   }
+
   private prefetchIdPages(numbers: readonly number[]): void {
     const unread: number[] = [];
     for (const number of numbers) {
@@ -747,27 +758,18 @@ export class PostingReader {
     if (unread.length > 1) this.startPageReads('ids', unread);
   }
 
-  private async readIdPage(number: number): Promise<readonly string[]> {
+  private async readIdPage(number: number): Promise<PostingObjectIdPage> {
     const key = String(number);
     const hit = this.idCache.get(key);
     if (hit) return hit;
-    const raw: unknown = JSON.parse(new TextDecoder().decode(await this.readPage('ids', number)));
+    const bytes = await this.readPage('ids', number);
     const expected = Math.min(
       this.manifest.idsPerPage,
       this.manifest.documents - number * this.manifest.idsPerPage
     );
-    if (!Array.isArray(raw) || raw.length !== expected)
-      throw new Error('POSTING_OBJECT_IDS_INVALID');
-    let size = 48;
-    let previousId = '';
-    for (const id of raw) {
-      if (typeof id !== 'string' || !/^[\x21-\x7e]{1,128}$/.test(id) || id <= previousId)
-        throw new Error('POSTING_OBJECT_IDS_INVALID');
-      previousId = id;
-      size += 24 + id.length * 2;
-    }
-    this.idCache.put(key, raw, size);
-    return raw;
+    const page = decodePostingObjectIds(bytes, expected);
+    this.idCache.put(key, page, 48 + bytes.byteLength + page.offsets.byteLength);
+    return page;
   }
   /** Enumerate immutable, ascending IDs in batches using only ID pages. */
   async *idBatches(): AsyncGenerator<readonly string[]> {
@@ -779,7 +781,10 @@ export class PostingReader {
       for (let page = start; page < end; page++) numbers.push(page);
       this.prefetchIdPages(numbers);
       const batches = await Promise.all(numbers.map((number) => this.readIdPage(number)));
-      for (const ids of batches) {
+      for (const page of batches) {
+        const ids: string[] = [];
+        for (let index = 0; index + 1 < page.offsets.length; index++)
+          ids.push(postingObjectIdAt(page, index));
         if (ids[0]! <= previous) throw new Error('POSTING_OBJECT_IDS_INVALID');
         previous = ids[ids.length - 1]!;
         yield ids;
@@ -931,7 +936,7 @@ export class PostingReader {
     // been inserted after the frozen snapshot, so equality is not required.
     const { idsPerPage } = this.manifest;
     let loadedPage = -1;
-    let ids: readonly string[] = [];
+    let ids: PostingObjectIdPage | undefined;
     let low = 0,
       high = this.manifest.documents;
     while (low < high) {
@@ -941,7 +946,7 @@ export class PostingReader {
         ids = await this.readIdPage(page);
         loadedPage = page;
       }
-      if (ids[mid % idsPerPage]! <= lastId) low = mid + 1;
+      if (postingObjectIdAt(ids!, mid % idsPerPage) <= lastId) low = mid + 1;
       else high = mid;
     }
     return { tier, ordinal: low - 1 };
@@ -1010,6 +1015,7 @@ export class PostingReader {
       prefixOnly: ordinarySingleCharacter,
       kindRanks: createPostingKindRanks(this.manifest.kinds),
     };
+    let wordGroups: PostingTerm[][] | undefined;
     for (const [tierNumber, tier] of tiers.entries()) {
       if (result.results.length >= resultLimit) break;
       if (after && tierNumber < after.tier) continue;
@@ -1019,12 +1025,18 @@ export class PostingReader {
         cursor = this.cursor(await this.exact(key, includeCaseSensitiveKeys), tick);
       } else if (tier.stage === 'prefix') {
         const key = postingNameKey(tier.kind, lookupPhrase);
-        cursor = this.cursor(await this.prefix(key, includeCaseSensitiveKeys), tick);
+        try {
+          cursor = this.cursor(await this.prefix(key, includeCaseSensitiveKeys), tick);
+        } catch (error) {
+          if (!this.matchedTermLimitError || error !== this.matchedTermLimitError) throw error;
+          // Name-prefix matches also satisfy the query's word prefixes. Keep
+          // the original kind/tier check when this complete superset nominates.
+          wordGroups ??= await this.prefixMany([...new Set(words)], Boolean(includeCaseSensitiveKeys));
+          cursor = this.intersection(wordGroups, tick);
+        }
       } else if (tier.stage === 'word-prefix') {
-        const prefixWords = words.length === 1 ? words : new Set(words);
-        cursor = this.intersection(
-          await this.prefixMany(Array.from(prefixWords), Boolean(includeCaseSensitiveKeys)), tick
-        );
+        wordGroups ??= await this.prefixMany([...new Set(words)], Boolean(includeCaseSensitiveKeys));
+        cursor = this.intersection(wordGroups, tick);
       } else {
         cursor = this.intersection(
           await this.exactMany(Array.from(gramTerms), includeCaseSensitiveKeys), tick

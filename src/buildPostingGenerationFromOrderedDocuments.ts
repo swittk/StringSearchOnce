@@ -39,6 +39,14 @@ class RunWriter {
     }
   }
   async startTerm(term: string, count: number): Promise<void> {
+    const keyBytes = term.length * 2;
+    if (this.buffer.length - this.used >= 8 + keyBytes) {
+      this.buffer.writeUInt32LE(keyBytes, this.used);
+      this.buffer.writeUInt32LE(count, this.used + 4);
+      this.buffer.write(term, this.used + 8, keyBytes, 'utf16le');
+      this.used += 8 + keyBytes;
+      return;
+    }
     const key = Buffer.from(term, 'utf16le');
     this.header.writeUInt32LE(key.byteLength, 0);
     this.header.writeUInt32LE(count, 4);
@@ -91,14 +99,14 @@ class RunReader {
   private async readInto(target: Buffer): Promise<void> {
     let at = 0;
     while (at < target.byteLength) {
-      if (!await this.ensure(1)) throw new Error('POSTING_RUN_TRUNCATED');
+      if (this.end === this.start && !await this.ensure(1)) throw new Error('POSTING_RUN_TRUNCATED');
       const count = Math.min(target.byteLength - at, this.end - this.start);
       target.set(this.buffer.subarray(this.start, this.start + count), at);
       at += count; this.start += count;
     }
   }
   async nextTerm(): Promise<boolean> {
-    if (!await this.ensure(8)) {
+    if (this.end - this.start < 8 && !await this.ensure(8)) {
       if (this.start !== this.end) throw new Error('POSTING_RUN_TRUNCATED');
       this.term = undefined;
       return false;
@@ -107,15 +115,20 @@ class RunReader {
     this.count = this.buffer.readUInt32LE(this.start + 4);
     this.remaining = this.count;
     this.start += 8;
-    const key = Buffer.allocUnsafe(keyBytes);
-    await this.readInto(key);
-    this.term = key.toString('utf16le');
+    if (this.end - this.start >= keyBytes) {
+      this.term = this.buffer.toString('utf16le', this.start, this.start + keyBytes);
+      this.start += keyBytes;
+    } else {
+      const key = Buffer.allocUnsafe(keyBytes);
+      await this.readInto(key);
+      this.term = key.toString('utf16le');
+    }
     return true;
   }
   async copyIds(writer: RunWriter): Promise<void> {
     let bytes = this.remaining * 4;
     while (bytes) {
-      if (!await this.ensure(1)) throw new Error('POSTING_RUN_TRUNCATED');
+      if (this.end === this.start && !await this.ensure(1)) throw new Error('POSTING_RUN_TRUNCATED');
       const count = Math.min(bytes, this.end - this.start);
       await writer.write(this.buffer.subarray(this.start, this.start + count));
       this.start += count; bytes -= count;
@@ -124,7 +137,7 @@ class RunReader {
   }
   async appendIds(target: number[], count: number): Promise<void> {
     while (count) {
-      if (!await this.ensure(4)) throw new Error('POSTING_RUN_TRUNCATED');
+      if (this.end - this.start < 4 && !await this.ensure(4)) throw new Error('POSTING_RUN_TRUNCATED');
       const take = Math.min(count, (this.end - this.start) >>> 2);
       for (let i = 0; i < take; i++)
         target.push(this.buffer.readUInt32LE(this.start + i * 4));

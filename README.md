@@ -107,7 +107,7 @@ A build creates an immutable manifest and five groups of compressed
 | lexicon | Sorted terms with inline singleton ordinals or larger-list descriptor ranges |
 | descriptors | Fixed-width posting-chunk locations and ordinal fences |
 | postings | Sorted integer ordinals encoded as delta-varints |
-| ids | Mapping from ordinals to the original IDs |
+| ids | ID lengths and ASCII bytes, addressed by ordinal |
 
 Pages use raw DEFLATE compression. Use a unique generation identifier. Build
 and store all pages. Construct a reader for the stored generation with the
@@ -116,7 +116,8 @@ manifest visible. Opening reads only the sparse directory. Exact and multi-gram
 lookups load the needed lexicon blocks; hot terms seek within independently
 paged chunk descriptors instead of loading one large per-term directory. A term
 that occurs in one document stores its ordinal directly in the lexicon, with no
-posting chunk or descriptor.
+posting chunk or descriptor. ID pages retain compact bytes and offsets; only
+requested IDs become strings during search.
 
 A `PostingReader` stays bound to one immutable generation. `maxLexiconBytes`
 defaults to 32 MiB and bounds the estimated retained directory plus parsed
@@ -160,6 +161,14 @@ filters and return at most one current record per requested ID. Deleted,
 denied, and stale-name candidates are excluded before the
 limit; the reader continues to later candidates when needed. Optional
 `filterCandidates` can perform additional eligibility checks.
+When a name-prefix expansion exceeds `maxMatchedTerms`, the reader can nominate
+from complete word-prefix groups instead. If one word group exceeds the limit,
+its whole incomplete expansion is discarded; the remaining complete groups
+supply a candidate superset and current source names still verify every word.
+A complete empty group proves that tier empty. If no complete group is
+available, the request retains the matched-term error. Source and cursor work
+limits still apply to every plan.
+
 A changed name absent from the built snapshot cannot be discovered just by
 rechecking the source rows. Rebuild or provide a live overlay at the application
 layer.

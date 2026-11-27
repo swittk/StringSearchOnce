@@ -1,11 +1,15 @@
-import { postingGrams, postingNameKey, type PostingName } from './postingFormat';
-import { caseSensitivePostingPrefix, lowercasePostingText } from './postingText';
+import { postingNameKey, type PostingName } from './postingFormat';
+import { caseSensitivePostingPrefix, lowercasePostingText, appendPostingGrams } from './postingText';
+
+const symbolCharacter = /^\p{S}$/u;
 
 function addNameTerms(terms: Set<string>, kind: string, text: string): void {
   terms.add(postingNameKey(kind, text));
   for (const token of text.split(/\s+/u)) if (token) terms.add('w|' + token);
-  for (const width of [2, 3]) for (const gram of postingGrams(text, width)) terms.add(gram);
-  for (const char of text) if (/^\p{S}$/u.test(char)) terms.add('g1|' + char);
+  const chars = Array.from(text);
+  appendPostingGrams(terms, chars, 2);
+  appendPostingGrams(terms, chars, 3);
+  for (const char of chars) if (symbolCharacter.test(char)) terms.add('g1|' + char);
 }
 
 /** Shared by both builders so each source contributes an ordinal only once per key. */
