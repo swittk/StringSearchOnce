@@ -1,6 +1,6 @@
 {
   "name": "stringsearchonce",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Embedded Unicode substring search over compressed, independently retrievable posting pages",
   "license": "MIT",
   "type": "module",
@@ -19,13 +19,26 @@
       }
     }
   },
-  "files": ["dist", "README.md", "LICENSE"],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/swittk/StringSearchOnce.git"
   },
-  "keywords": ["substring", "search", "inverted-index", "postings", "compression", "unicode"],
-  "engines": { "node": "^18.18.0 || >=20.5.0" },
+  "keywords": [
+    "substring",
+    "search",
+    "inverted-index",
+    "postings",
+    "compression",
+    "unicode"
+  ],
+  "engines": {
+    "node": "^18.18.0 || >=20.5.0"
+  },
   "scripts": {
     "build": "tsup",
     "typecheck": "tsc --noEmit",
