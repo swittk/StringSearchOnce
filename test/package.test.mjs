@@ -18,6 +18,7 @@ test('packed artifact works outside the checkout, with ESM/CJS workers and decla
     writeFileSync(join(dir,'package.json'), '{"name":"consumer-test","private":true,"type":"module"}');
     run('npm', ['install', '--offline', '--ignore-scripts', '--no-audit', '--no-fund', join(dir,packed.filename)]);
     const body = `
+if (POSTING_INDEX_COMPATIBILITY_VERSION !== 0) throw Error('Bad index compatibility export');
 const rows = [{id:'01', names:[{kind:'title',text:'Blue desk'}]}];
 const built = await buildPostingGenerationInWorker(rows,{generation:'test',kinds:['title']});
 const reader = new PostingReader(built.manifest,{
@@ -38,9 +39,9 @@ const page = await PostingReader.searchCompositePage([reader], {
 });
 if (page.results[0]?.object.id !== '01') throw Error('Bad composite result');
 `;
-    const esm = `import {buildPostingGenerationInWorker,PostingReader} from 'stringsearchonce';\n` + body;
+    const esm = `import {POSTING_INDEX_COMPATIBILITY_VERSION,buildPostingGenerationInWorker,PostingReader} from 'stringsearchonce';\n` + body;
     writeFileSync(join(dir,'esm.mjs'), esm);
-    writeFileSync(join(dir,'cjs.cjs'), `const {buildPostingGenerationInWorker,PostingReader}=require('stringsearchonce');
+    writeFileSync(join(dir,'cjs.cjs'), `const {POSTING_INDEX_COMPATIBILITY_VERSION,buildPostingGenerationInWorker,PostingReader}=require('stringsearchonce');
 (async()=>{
 ${body}
 })().catch(e=>{console.error(e);process.exitCode=1});`);
@@ -55,6 +56,7 @@ ${body}
       input: esm, stdio: ['pipe', 'pipe', 'pipe'],
     });
     const typed = `
+const indexCompatibility: 0 = POSTING_INDEX_COMPATIBILITY_VERSION;
 const rows: PostingDocument[] = [{id:'01',names:[{kind:'title',text:'Desk'}]}];
 const built = buildPostingGeneration(rows,{generation:'test',kinds:['title']});
 const store: PostingPageStore = {async readPages(_generation,kind,pages) {
@@ -68,7 +70,7 @@ const page: Promise<PostingCompositePageResult<PostingDocument>> = PostingReader
   readLive:async(after,limit)=>after?.id === '01' || !limit ? [] : [{object:rows[0],stage:'exact',kind:'title'}],
 });
 `;
-    const imports = `import {buildPostingGeneration,PostingReader,type PostingDocument,type PostingPageStore,type PostingCompositePageResult} from 'stringsearchonce';
+    const imports = `import {POSTING_INDEX_COMPATIBILITY_VERSION,buildPostingGeneration,PostingReader,type PostingDocument,type PostingPageStore,type PostingCompositePageResult} from 'stringsearchonce';
 `;
     writeFileSync(join(dir,'typed.mts'), imports + typed);
     writeFileSync(join(dir,'typed.cts'), imports + typed);

@@ -162,10 +162,21 @@ Live edits can move a match across the cursor. Include a live revision in
 `scopeKey` to restart traversal on such edits. The caller owns live nomination,
 source reads and publication.
 
+Source-fetch batches adapt to remaining result demand and the observed acceptance
+rate within each rank tier. The caller's `batchSize` remains a ceiling. Rows fetched
+beyond the required result and lookahead prefix are not ranked.
+
 The reader has explicit limits for cache size, lexicon size, candidate reads,
 and cursor work. Exceeding a limit throws rather than returning silently
-truncated results. Format 0 is pre-release; do not assume compatibility with
-future incompatible formats.
+truncated results. If multiple work limits are insufficient, batching can affect
+which exhausted limit is reported first.
+
+`POSTING_INDEX_COMPATIBILITY_VERSION` identifies the stored index contract:
+page encoding plus persisted normalization, token and gram semantics. Its value
+is `0`, matching indexes built by version 0.1.1. Applications can include it in
+their own index fingerprints without rebuilding for unrelated package releases.
+It changes when existing indexes need rebuilding; signed-cursor compatibility is
+tracked separately.
 
 ## Tests and benchmark
 
