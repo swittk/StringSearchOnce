@@ -1,21 +1,26 @@
 import {
-  POSTING_INDEX_COMPATIBILITY_VERSION,
-  comparePostingIds,
-  decodePostingIds,
-  foldPostingText,
-  postingGrams,
-  postingNameKey,
-  unpackPostingPage,
-  type PostingChunk,
-  type PostingManifest,
-  type PostingName,
-  type PostingPageKind,
-  type PostingPageStore,
-  type PostingTerm,
+  POSTING_INDEX_COMPATIBILITY_VERSION, postingDescriptorAt as descriptorAt,
+  comparePostingIds, decodePostingIds, foldPostingText, postingGrams,
+  postingNameKey, unpackPostingPage,
+  type PostingManifest, type PostingPageKind, type PostingPageStore,
+  type PostingTerm, type PostingDirectoryEntry as DirectoryEntry,
+  type PostingChunk, type PostingName,
 } from './postingFormat';
 import { postingCursorDigest, readPostingCursor, writePostingCursor } from './postingCursor';
-import { maxPostingPages } from './postingLimits';
 import { caseSensitivePostingPrefix, lowercasePostingText } from './postingText';
+import { maxPostingPages } from './postingLimits';
+
+function isDirectoryEntry(value: unknown): value is DirectoryEntry {
+  return Array.isArray(value) && value.length === 2 &&
+    typeof value[0] === 'string' && typeof value[1] === 'number';
+}
+function isPostingTerm(value: unknown): value is PostingTerm {
+  if (!Array.isArray(value) || (value.length !== 2 && value.length !== 6) ||
+      typeof value[0] !== 'string') return false;
+  for (let field = 1; field < value.length; field++)
+    if (!Number.isSafeInteger(value[field]) || value[field] < 0) return false;
+  return true;
+}
 
 const ordinaryPostingCharacter = /^[^\p{S}]$/u;
 
@@ -256,47 +261,54 @@ interface Cursor {
 }
 const emptyCursor = (): Cursor => ({ peek: () => Infinity, seek: async () => Infinity });
 
-/** Skip whole chunks by their last ID before reading/decompressing any bytes. */
+/** Same ordinal-fence seek, with bounded descriptor pages instead of a materialized hot list. */
 class ListCursor implements Cursor {
   private position = 0;
   private current: number;
+  private currentHeader?: PostingChunk;
   constructor(
-    private chunks: readonly PostingChunk[],
-    private load: (chunk: PostingChunk) => Promise<Uint32Array>,
+    private term: PostingTerm,
+    private header: (index: number) => PostingChunk | Promise<PostingChunk>,
+    private load: (chunk: PostingChunk) => Uint32Array | Promise<Uint32Array>,
     private tick: () => void
   ) {
-    this.current = chunks[0]?.[4] ?? Infinity;
+    this.current = term.length === 2 ? term[1] : term[4];
   }
-  peek(): number {
-    return this.current;
-  }
+  peek(): number { return this.current; }
   async seek(target: number): Promise<number> {
     if (this.current >= target) return this.current;
     this.tick();
-    let lo = this.position,
-      hi = this.chunks.length;
-    while (lo < hi) {
-      const mid = (lo + hi) >>> 1;
-      if (this.chunks[mid]![5] < target) lo = mid + 1;
-      else hi = mid;
+    if (this.term.length === 2) return (this.current = Infinity);
+    if (target > this.term[5]) return (this.current = Infinity);
+    let chunk = this.currentHeader;
+    if (!chunk || chunk[5] < target) {
+      let lo = this.position, hi = this.term[3];
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        const located = this.header(mid);
+        const header = located instanceof Promise ? await located : located;
+        if (header[5] < target) lo = mid + 1;
+        else hi = mid;
+      }
+      this.position = lo;
+      if (lo >= this.term[3]) return (this.current = Infinity);
+      const located = this.header(lo);
+      chunk = located instanceof Promise ? await located : located;
+      this.currentHeader = chunk;
     }
-    this.position = lo;
-    const chunk = this.chunks[lo];
-    if (!chunk) return (this.current = Infinity);
     if (chunk[4] >= target) return (this.current = chunk[4]);
-    const ids = await this.load(chunk);
-    lo = 0;
-    hi = ids.length;
-    while (lo < hi) {
-      const mid = (lo + hi) >>> 1;
-      if (ids[mid]! < target) lo = mid + 1;
-      else hi = mid;
+    const loaded = this.load(chunk);
+    const ids = loaded instanceof Promise ? await loaded : loaded;
+    let left = 0, right = ids.length;
+    while (left < right) {
+      const mid = (left + right) >>> 1;
+      if (ids[mid]! < target) left = mid + 1;
+      else right = mid;
     }
-    return (this.current = ids[lo] ?? Infinity);
+    return (this.current = ids[left] ?? Infinity);
   }
 }
 
-/** Merge posting streams by ordinal. This heap never contains hydrated source objects. */
 class UnionCursor implements Cursor {
   private heap: Cursor[];
   constructor(cursors: Cursor[], private tick: () => void) {
@@ -365,10 +377,9 @@ class IntersectionCursor implements Cursor {
  * not source objects. Live write/delete capture is deliberately not claimed here.
  */
 export class PostingReader {
-  private terms: string[] = [];
-  private counts = new Uint32Array(0);
-  private chunkOffsets = new Uint32Array(0);
-  private chunkTable = new Uint32Array(0);
+  private directory: DirectoryEntry[] = [];
+  private lexiconCache: ByteCache<readonly PostingTerm[]>;
+  private readonly pendingLexicon = new Map<number, Promise<readonly PostingTerm[]>>();
   private opened?: Promise<void>;
   private readonly pageCache: ByteCache<Uint8Array>;
   private readonly chunkCache: ByteCache<Uint32Array>;
@@ -382,6 +393,9 @@ export class PostingReader {
     chunkDecodes: 0,
     lexiconBytes: 0,
     lexiconEstimatedBytes: 0,
+    directoryBytes: 0,
+    directoryEstimatedBytes: 0,
+    cursorSteps: 0,
   };
   constructor(
     readonly manifest: PostingManifest,
@@ -407,19 +421,18 @@ export class PostingReader {
       throw new Error('POSTING_MANIFEST_INVALID');
     if (m.kinds.some((kind) => typeof kind !== 'string' || !kind) || new Set(m.kinds).size !== m.kinds.length)
       throw new Error('POSTING_MANIFEST_INVALID');
-    for (const count of [m.documents, m.terms, m.lexiconPages, m.postingPages, m.idPages, m.idsPerPage]) {
+    for (const count of [m.documents, m.terms, m.directoryPages, m.lexiconPages, m.descriptorPages, m.postingPages, m.idPages, m.idsPerPage, m.descriptorsPerPage]) {
       if (!Number.isSafeInteger(count) || count < 0)
         throw new Error('POSTING_MANIFEST_INVALID');
     }
-    if (m.documents > 0xffffffff || m.terms > Math.floor(lexiconLimit / 32))
+    if (m.documents > 0xffffffff)
       throw new Error('POSTING_MANIFEST_INVALID');
-    if (m.lexiconPages > 65536 || m.postingPages > maxPostingPages)
+    if (m.postingPages > maxPostingPages || m.descriptorsPerPage < 1)
       throw new Error('POSTING_MANIFEST_INVALID');
     if (m.idsPerPage < 1 || m.idsPerPage > 4096)
       throw new Error('POSTING_MANIFEST_INVALID');
     if (m.idPages !== Math.ceil(m.documents / m.idsPerPage))
       throw new Error('POSTING_MANIFEST_INVALID');
-    this.manifest = { ...m, kinds: [...m.kinds] };
     const budgets = [
       options.pageCacheBytes ?? 4 * 1048576,
       options.chunkCacheBytes ?? 4 * 1048576,
@@ -430,115 +443,125 @@ export class PostingReader {
     this.pageCache = new ByteCache(budgets[0]!);
     this.chunkCache = new ByteCache(budgets[1]!);
     this.idCache = new ByteCache(budgets[2]!);
+    this.lexiconCache = new ByteCache(lexiconLimit);
   }
   /** Counters make cold loads and repeated Base64 decoding visible in benchmarks. */
-  cacheUsage(): { pages: number; chunks: number; ids: number; limit: number } {
+  cacheUsage(): { pages: number; chunks: number; ids: number; directory: number; lexicon: number; limit: number } {
     return {
       pages: this.pageCache.bytes,
       chunks: this.chunkCache.bytes,
       ids: this.idCache.bytes,
-      limit: this.pageCache.limit + this.chunkCache.limit + this.idCache.limit,
+      directory: this.counters.directoryEstimatedBytes,
+      lexicon: this.lexiconCache.bytes,
+      limit: this.pageCache.limit + this.chunkCache.limit + this.idCache.limit +
+        this.lexiconCache.limit + this.counters.directoryEstimatedBytes,
     };
   }
-  /** Load the bounded term directory once for this generation, in batched storage reads. */
+  /** Load only the sparse block directory; terms and chunk descriptors remain paged. */
   async open(): Promise<void> {
     if (!this.opened)
-      this.opened = this.loadLexicon().catch((error) => {
+      this.opened = this.loadDirectory().catch((error) => {
         this.opened = undefined;
-        this.terms = [];
+        this.directory = [];
         throw error;
       });
     await this.opened;
   }
-  private async loadLexicon(): Promise<void> {
-    const terms: string[] = [];
-    const counts = new Uint32Array(this.manifest.terms),
-      offsets = new Uint32Array(this.manifest.terms + 1);
-    let table = new Uint32Array(Math.max(6, this.manifest.terms * 6));
-    let bytes = 0,
-      stringBytes = 0,
-      used = 0,
-      previous = '';
+  private async loadDirectory(): Promise<void> {
+    const entries: DirectoryEntry[] = [];
     const maximum = this.options.maxLexiconBytes ?? 32 * 1048576;
-    const retainedBytes = () =>
-      stringBytes + counts.byteLength + offsets.byteLength + table.byteLength;
-    if (retainedBytes() > maximum) throw new Error('POSTING_LEXICON_BUDGET_EXCEEDED');
-    // Bound cold storage responses; the directory loads once per generation.
-    const lexiconPageBatchSize = 4;
-    for (let start = 0; start < this.manifest.lexiconPages; start += lexiconPageBatchSize) {
-      const numbers = Array.from(
-        { length: Math.min(lexiconPageBatchSize, this.manifest.lexiconPages - start) },
-        (_, i) => start + i
-      );
+    let retained = 0, decodedBytes = 0, previous = '';
+    for (let start = 0; start < this.manifest.directoryPages; start += 4) {
+      const numbers = Array.from({ length: Math.min(4, this.manifest.directoryPages - start) }, (_, i) => start + i);
       this.counters.storeReads++;
-      const pages = await this.store.readPages(this.manifest.generation, 'lexicon', numbers);
+      const pages = await this.store.readPages(this.manifest.generation, 'directory', numbers);
       this.counters.pagesRead += pages.size;
-      for (const page of numbers) {
-        const payload = pages.get(page);
-        if (!payload) throw new Error('POSTING_LEXICON_PAGE_MISSING');
+      for (const number of numbers) {
+        const payload = pages.get(number);
+        if (!payload) throw new Error('POSTING_DIRECTORY_PAGE_MISSING');
         const decoded = unpackPostingPage(payload, 262144);
         this.counters.pageDecodes++;
-        bytes += decoded.byteLength;
-        if (bytes > maximum) throw new Error('POSTING_LEXICON_BUDGET_EXCEEDED');
+        decodedBytes += decoded.byteLength;
         const raw: unknown = JSON.parse(new TextDecoder().decode(decoded));
-        if (!Array.isArray(raw)) throw new Error('POSTING_LEXICON_INVALID');
-        for (const value of raw) {
-          if (!Array.isArray(value) || value.length !== 3)
-            throw new Error('POSTING_TERM_INVALID');
-          const [term, count, chunks] = value;
-          if (typeof term !== 'string' || term <= previous)
-            throw new Error('POSTING_TERM_INVALID');
-          if (!Number.isSafeInteger(count) || count < 1)
-            throw new Error('POSTING_TERM_INVALID');
-          if (!Array.isArray(chunks) || !chunks.length)
-            throw new Error('POSTING_TERM_INVALID');
-          if (terms.length >= this.manifest.terms)
-            throw new Error('POSTING_LEXICON_COUNT_MISMATCH');
-          offsets[terms.length] = used;
-          let last = -1,
-            total = 0;
-          for (const chunk of chunks) {
-            if (!Array.isArray(chunk) || chunk.length !== 6)
-              throw new Error('POSTING_CHUNK_INVALID');
-            for (const cell of chunk) {
-              if (!Number.isSafeInteger(cell) || cell < 0)
-                throw new Error('POSTING_CHUNK_INVALID');
-            }
-            const [pageNumber, byteOffset, byteLength, idCount, firstId, lastId] = chunk;
-            if (pageNumber >= this.manifest.postingPages || byteLength < 1 || byteOffset + byteLength > 131072)
-              throw new Error('POSTING_CHUNK_INVALID');
-            if (idCount < 1 || idCount > 4096)
-              throw new Error('POSTING_CHUNK_INVALID');
-            if (firstId <= last || lastId < firstId || lastId >= this.manifest.documents)
-              throw new Error('POSTING_CHUNK_INVALID');
-            if (used + 6 > table.length) {
-              if (retainedBytes() + table.byteLength > maximum)
-                throw new Error('POSTING_LEXICON_BUDGET_EXCEEDED');
-              const larger = new Uint32Array(table.length * 2);
-              larger.set(table);
-              table = larger;
-            }
-            for (let cell = 0; cell < 6; cell++) table[used++] = chunk[cell];
-            last = lastId;
-            total += idCount;
-          }
-          if (total !== count) throw new Error('POSTING_TERM_COUNT_MISMATCH');
-          counts[terms.length] = count;
-          terms.push(term);
-          previous = term;
-          stringBytes += 40 + term.length * 2;
-          if (retainedBytes() > maximum) throw new Error('POSTING_LEXICON_BUDGET_EXCEEDED');
+        if (!Array.isArray(raw)) throw new Error('POSTING_DIRECTORY_INVALID');
+        for (const entry of raw) {
+          if (!isDirectoryEntry(entry) ||
+              entry[0] <= previous || entry[1] !== entries.length)
+            throw new Error('POSTING_DIRECTORY_INVALID');
+          const value = entry;
+          entries.push(value);
+          previous = value[0];
+          retained += 56 + 2 * value[0].length;
+          if (retained > maximum || decodedBytes > maximum)
+            throw new Error('POSTING_LEXICON_BUDGET_EXCEEDED');
         }
       }
     }
-    if (terms.length !== this.manifest.terms) throw new Error('POSTING_LEXICON_COUNT_MISMATCH');
-    offsets[terms.length] = used;
-    this.terms = terms;
-    this.counts = counts;
-    this.chunkOffsets = offsets;
-    this.chunkTable = table.subarray(0, used);
-    this.counters.lexiconBytes = bytes;
-    this.counters.lexiconEstimatedBytes = retainedBytes();
+    if (entries.length !== this.manifest.lexiconPages)
+      throw new Error('POSTING_DIRECTORY_COUNT_MISMATCH');
+    this.directory = entries;
+    this.lexiconCache = new ByteCache(maximum - retained);
+    this.counters.directoryBytes = decodedBytes;
+    this.counters.directoryEstimatedBytes = retained;
+    this.counters.lexiconEstimatedBytes = retained;
+  }
+  private directoryLowerBound(term: string): number {
+    let lo = 0, hi = this.directory.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (this.directory[mid]![0] < term) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  }
+  private exactPage(term: string): number | undefined {
+    const entry = this.directory[this.directoryLowerBound(term)];
+    return entry?.[1];
+  }
+  private async readLexiconPage(number: number): Promise<readonly PostingTerm[]> {
+    const cached = this.lexiconCache.get(String(number));
+    if (cached) return cached;
+    let pending = this.pendingLexicon.get(number);
+    if (!pending) {
+      pending = (async () => {
+        const bytes = await this.readPage('lexicon', number);
+        this.counters.lexiconBytes += bytes.byteLength;
+        const raw: unknown = JSON.parse(new TextDecoder().decode(bytes));
+        if (!Array.isArray(raw)) throw new Error('POSTING_LEXICON_INVALID');
+        const terms: PostingTerm[] = [];
+        let previous = '', retained = 48;
+        for (const entry of raw) {
+          if (!isPostingTerm(entry) || entry[0] <= previous)
+            throw new Error('POSTING_TERM_INVALID');
+          if (entry.length === 2) {
+            if (entry[1] >= this.manifest.documents) throw new Error('POSTING_TERM_INVALID');
+          } else if (entry[1] < 2 || entry[3] < 1 || entry[5] < entry[4] ||
+              entry[5] >= this.manifest.documents ||
+              entry[2] + entry[3] > this.manifest.descriptorPages * this.manifest.descriptorsPerPage) {
+            throw new Error('POSTING_TERM_INVALID');
+          }
+          const value = entry;
+          terms.push(value);
+          previous = value[0];
+          retained += (value.length === 2 ? 64 : 96) + 2 * value[0].length;
+        }
+        const fence = this.directory[number];
+        if (!fence || terms.at(-1)?.[0] !== fence[0] ||
+            (number > 0 && terms[0]![0] <= this.directory[number - 1]![0]))
+          throw new Error('POSTING_DIRECTORY_FENCE_MISMATCH');
+        this.lexiconCache.put(String(number), terms, retained);
+        return terms;
+      })().finally(() => this.pendingLexicon.delete(number));
+      this.pendingLexicon.set(number, pending);
+    }
+    return pending;
+  }
+  private readDescriptor(index: number): PostingChunk | Promise<PostingChunk> {
+    const page = Math.floor(index / this.manifest.descriptorsPerPage);
+    const position = index % this.manifest.descriptorsPerPage;
+    const cached = this.pageCache.get('descriptors:' + page);
+    if (cached) return descriptorAt(cached, position);
+    return this.readPage('descriptors', page).then((bytes) => descriptorAt(bytes, position));
   }
   private async readPage(kind: PostingPageKind, page: number): Promise<Uint8Array> {
     const key = kind + ':' + page;
@@ -558,7 +581,8 @@ export class PostingReader {
     })();
     // A 128-character ID can double through JSON escaping. Count quotes,
     // separators and array brackets for a full page.
-    const maxBytes = kind === 'ids' ? this.manifest.idsPerPage * (128 * 2 + 3) + 1 : 131072;
+    const maxBytes = kind === 'ids' ? this.manifest.idsPerPage * (128 * 2 + 3) + 1
+      : kind === 'lexicon' || kind === 'directory' ? 262144 : 131072;
     for (const page of numbers) {
       const key = kind + ':' + page;
       const pending = read.then((pages) => {
@@ -572,7 +596,7 @@ export class PostingReader {
       this.pendingPages.set(key, pending);
     }
   }
-  private async readChunk(chunk: PostingChunk): Promise<Uint32Array> {
+  private readChunk(chunk: PostingChunk): Uint32Array | Promise<Uint32Array> {
     const key = chunk[0] + ':' + chunk[1] + ':' + chunk[2];
     const hit = this.chunkCache.get(key);
     if (hit) return hit;
@@ -596,57 +620,72 @@ export class PostingReader {
     }
     return pending;
   }
-  private lowerBound(term: string): number {
-    let lo = 0,
-      hi = this.terms.length;
+  private termLowerBound(entries: readonly PostingTerm[], term: string): number {
+    let lo = 0, hi = entries.length;
     while (lo < hi) {
       const mid = (lo + hi) >>> 1;
-      if (this.terms[mid]! < term) lo = mid + 1;
+      if (entries[mid]![0] < term) lo = mid + 1;
       else hi = mid;
     }
     return lo;
   }
-  /** Materialize headers only for selected terms; the full directory uses packed integer buffers. */
-  private termAt(index: number): PostingTerm {
-    const chunks: PostingChunk[] = [];
-    for (let at = this.chunkOffsets[index]!; at < this.chunkOffsets[index + 1]!; at += 6) {
-      const t = this.chunkTable;
-      chunks.push([t[at]!, t[at + 1]!, t[at + 2]!, t[at + 3]!, t[at + 4]!, t[at + 5]!]);
+  /** Coalesce a multi-gram lookup into bounded reads of distinct lexicon blocks. */
+  private async exactMany(terms: readonly string[], includeCaseSensitiveKeys = false): Promise<readonly PostingTerm[][]> {
+    const keys = terms.flatMap((term) => includeCaseSensitiveKeys ? [term, caseSensitivePostingPrefix + term] : [term]);
+    const pages = [...new Set(keys.map((key) => this.exactPage(key)).filter((number): number is number => number !== undefined))];
+    for (let offset = 0; offset < pages.length; offset += 4) {
+      const batch = pages.slice(offset, offset + 4);
+      const missing = batch.filter((number) => !this.lexiconCache.has(String(number)) &&
+        !this.pageCache.has('lexicon:' + number) && !this.pendingPages.has('lexicon:' + number));
+      if (missing.length) this.startPageReads('lexicon', missing);
+      await Promise.all(batch.map((number) => this.readLexiconPage(number)));
     }
-    return [this.terms[index]!, this.counts[index]!, chunks];
+    return Promise.all(terms.map((term) => this.exact(term, includeCaseSensitiveKeys)));
   }
-  private exact(term: string, includeCaseSensitiveKeys = false): readonly PostingTerm[] {
-    const index = this.lowerBound(term);
-    const entries = this.terms[index] === term ? [this.termAt(index)] : [];
-    if (includeCaseSensitiveKeys) {
-      const additional = caseSensitivePostingPrefix + term;
-      const index = this.lowerBound(additional);
-      if (this.terms[index] === additional) entries.push(this.termAt(index));
+  private async exact(term: string, includeCaseSensitiveKeys = false): Promise<PostingTerm[]> {
+    const entries: PostingTerm[] = [];
+    for (const key of includeCaseSensitiveKeys ? [term, caseSensitivePostingPrefix + term] : [term]) {
+      const number = this.exactPage(key);
+      if (number === undefined) continue;
+      const page = await this.readLexiconPage(number);
+      const found = page[this.termLowerBound(page, key)];
+      if (found?.[0] === key) entries.push(found);
     }
     return entries;
   }
-  private prefix(term: string, includeCaseSensitiveKeys = false): readonly PostingTerm[] {
+  private async prefixMany(words: readonly string[], includeCaseSensitiveKeys: boolean): Promise<PostingTerm[][]> {
+    const reads = words.map((word) => this.prefix('w|' + word, includeCaseSensitiveKeys));
+    return Promise.all(reads).catch(async (error: unknown) => {
+      await Promise.allSettled(reads);
+      throw error;
+    });
+  }
+  private async prefix(term: string, includeCaseSensitiveKeys = false): Promise<PostingTerm[]> {
     const limit = this.options.maxMatchedTerms ?? 20000;
     const entries: PostingTerm[] = [];
-    this.appendMatchingTerms(entries, term, limit);
+    await this.appendMatchingTerms(entries, term, limit);
     if (includeCaseSensitiveKeys)
-      this.appendMatchingTerms(entries, caseSensitivePostingPrefix + term, limit - entries.length);
+      await this.appendMatchingTerms(entries, caseSensitivePostingPrefix + term, limit);
     return entries;
   }
-  private appendMatchingTerms(entries: PostingTerm[], term: string, remaining: number): void {
-    const first = this.lowerBound(term);
-    const stop = Math.min(this.terms.length, first + remaining);
-    let end = first;
-    while (end < stop && this.terms[end]!.startsWith(term)) end++;
-    if (end === stop && this.terms[end]?.startsWith(term))
-      throw new Error('POSTING_MATCHED_TERM_LIMIT');
-    for (let index = first; index < end; index++) entries.push(this.termAt(index));
+  private async appendMatchingTerms(entries: PostingTerm[], term: string, limit: number): Promise<void> {
+    for (let index = this.directoryLowerBound(term); index < this.directory.length; index++) {
+      const fence = this.directory[index]!;
+      const page = await this.readLexiconPage(fence[1]);
+      for (let at = this.termLowerBound(page, term); at < page.length; at++) {
+        const entry = page[at]!;
+        if (!entry[0].startsWith(term)) return;
+        if (entries.length >= limit) throw new Error('POSTING_MATCHED_TERM_LIMIT');
+        entries.push(entry);
+      }
+    }
   }
   private cursor(entries: readonly PostingTerm[], tick: () => void): Cursor {
     if (!entries.length) return emptyCursor();
-    const lists = entries.map(
-      (entry) => new ListCursor(entry[2], (chunk) => this.readChunk(chunk), tick)
-    );
+    const lists = entries.map((entry) => {
+      const firstDescriptor = entry.length === 2 ? 0 : entry[2];
+      return new ListCursor(entry, (index) => this.readDescriptor(firstDescriptor + index), (chunk) => this.readChunk(chunk), tick);
+    });
     return lists.length === 1 ? lists[0]! : new UnionCursor(lists, tick);
   }
   private intersection(
@@ -658,7 +697,7 @@ export class PostingReader {
     for (const entries of groups) {
       if (!entries.length) return emptyCursor();
       let size = 0;
-      for (const entry of entries) size += entry[1];
+      for (const entry of entries) size += entry.length === 2 ? 1 : entry[1];
       groupsBySize.push({ entries, size });
     }
     groupsBySize.sort((a, b) => a.size - b.size);
@@ -939,7 +978,7 @@ export class PostingReader {
     if (words.length > 32) throw new Error('POSTING_QUERY_TOO_LONG');
     await this.open();
     const includeCaseSensitiveKeys =
-      options.caseSensitive && this.terms.at(-1)?.startsWith(caseSensitivePostingPrefix);
+      options.caseSensitive && this.directory.at(-1)?.[0].startsWith(caseSensitivePostingPrefix);
     const matchingWords = options.caseSensitive ? matchingPhrase.split(/\s+/u) : words;
     let cursorLimitError: Error | undefined;
     const tick = () => {
@@ -977,18 +1016,18 @@ export class PostingReader {
       let cursor: Cursor;
       if (tier.stage === 'exact') {
         const key = postingNameKey(tier.kind, lookupPhrase);
-        cursor = this.cursor(this.exact(key, includeCaseSensitiveKeys), tick);
+        cursor = this.cursor(await this.exact(key, includeCaseSensitiveKeys), tick);
       } else if (tier.stage === 'prefix') {
         const key = postingNameKey(tier.kind, lookupPhrase);
-        cursor = this.cursor(this.prefix(key, includeCaseSensitiveKeys), tick);
+        cursor = this.cursor(await this.prefix(key, includeCaseSensitiveKeys), tick);
       } else if (tier.stage === 'word-prefix') {
         const prefixWords = words.length === 1 ? words : new Set(words);
         cursor = this.intersection(
-          Array.from(prefixWords, (word) => this.prefix('w|' + word, includeCaseSensitiveKeys)), tick
+          await this.prefixMany(Array.from(prefixWords), Boolean(includeCaseSensitiveKeys)), tick
         );
       } else {
         cursor = this.intersection(
-          Array.from(gramTerms, (term) => this.exact(term, includeCaseSensitiveKeys)), tick
+          await this.exactMany(Array.from(gramTerms), includeCaseSensitiveKeys), tick
         );
       }
       let nextOrdinal = after && tierNumber === after.tier ? after.ordinal + 1 : 0;

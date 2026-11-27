@@ -6,7 +6,7 @@ import { lowercasePostingText } from './postingText';
  * Change only when existing indexes need rebuilding, independently of package
  * releases and signed-cursor versions.
  */
-export const POSTING_INDEX_COMPATIBILITY_VERSION = 0;
+export const POSTING_INDEX_COMPATIBILITY_VERSION = 1;
 
 /** One selected source name. The index does not inspect arbitrary object fields. */
 export type PostingName = { kind: string; text: string };
@@ -14,8 +14,15 @@ export type PostingName = { kind: string; text: string };
 export type PostingDocument = { id: string; names: readonly PostingName[] };
 /** [page number, byte offset, byte length, ID count, first ordinal, last ordinal]. */
 export type PostingChunk = readonly [number, number, number, number, number, number];
-/** [term, total ID count, compressed-page locations]. */
-export type PostingTerm = readonly [string, number, readonly PostingChunk[]];
+/** A singleton needs only its term and ordinal; larger lists use paged descriptors. */
+export type PostingTerm = readonly [term: string, ordinal: number] | readonly [
+  term: string, count: number, firstDescriptor: number, descriptorCount: number,
+  firstOrdinal: number, lastOrdinal: number,
+];
+/** Inclusive upper term fence for a bounded lexicon page, in UTF-16 comparison order. */
+export type PostingDirectoryEntry = readonly [lastTerm: string, lexiconPage: number];
+/** Six unsigned 32-bit fields per chunk location, encoded in little-endian order. */
+export const POSTING_DESCRIPTOR_BYTES = 6 * Uint32Array.BYTES_PER_ELEMENT;
 /** A reader always binds to one immutable generation; it never mixes two builds. */
 export type PostingManifest = {
   format: typeof POSTING_INDEX_COMPATIBILITY_VERSION;
@@ -23,14 +30,17 @@ export type PostingManifest = {
   documents: number;
   terms: number;
   kinds: readonly string[];
+  directoryPages: number;
   lexiconPages: number;
+  descriptorPages: number;
   postingPages: number;
   idPages: number;
   idsPerPage: number;
+  descriptorsPerPage: number;
 };
 /** A compressed page is binary; the storage adapter owns any transport encoding. */
 export type PostingBytes = Uint8Array;
-export type PostingPageKind = 'lexicon' | 'postings' | 'ids';
+export type PostingPageKind = 'directory' | 'lexicon' | 'descriptors' | 'postings' | 'ids';
 /** Fetch only explicitly named pages from one private, immutable generation. */
 export interface PostingPageStore {
   readPages(
@@ -38,6 +48,10 @@ export interface PostingPageStore {
     kind: PostingPageKind,
     pages: readonly number[]
   ): Promise<ReadonlyMap<number, PostingBytes>>;
+}
+/** Persist one encoded page into an unpublished generation owned by the caller. */
+export interface PostingPageSink {
+  writePage(generation: string, kind: PostingPageKind, page: number, bytes: PostingBytes): Promise<void>;
 }
 /** Everything produced by a build, before publication. No source rows are stored here. */
 export type BuiltPostingGeneration = {
@@ -121,4 +135,24 @@ export function unpackPostingPage(value: PostingBytes, maxBytes: number): Uint8A
 /** UTF-8 JSON is used only for cold lexicon/ID pages, never for posting-list intersections. */
 export function packPostingJson(value: unknown): PostingBytes {
   return packPostingPage(new TextEncoder().encode(JSON.stringify(value)));
+}
+
+/** Encode a bounded page of chunk locations separately from the term dictionary. */
+export function encodePostingDescriptors(chunks: readonly PostingChunk[]): Uint8Array {
+  const bytes = new Uint8Array(chunks.length * POSTING_DESCRIPTOR_BYTES);
+  const view = new DataView(bytes.buffer);
+  for (let index = 0; index < chunks.length; index++)
+    for (let field = 0; field < 6; field++)
+      view.setUint32(index * POSTING_DESCRIPTOR_BYTES + field * 4, chunks[index]![field]!, true);
+  return bytes;
+}
+/** Read one chunk location without materializing the rest of a hot term's directory. */
+export function postingDescriptorAt(bytes: Uint8Array, index: number): PostingChunk {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const offset = index * POSTING_DESCRIPTOR_BYTES;
+  return [
+    view.getUint32(offset, true), view.getUint32(offset + 4, true),
+    view.getUint32(offset + 8, true), view.getUint32(offset + 12, true),
+    view.getUint32(offset + 16, true), view.getUint32(offset + 20, true),
+  ];
 }

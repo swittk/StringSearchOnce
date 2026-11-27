@@ -1,35 +1,5 @@
 {
-  "createdBy": "stringsearchonce@0.1.1",
-  "artifactSha256": "f40d9deb57669afa43727754ca718abba13d87db088416fd761eb03a30f816c5",
-  "description": "Frozen synthetic format-0 index. Includes rank tiers, multiple name kinds, cross-field words, composed/decomposed accents, Greek sigma, Thai, symbols and case-sensitive normalization.",
-  "manifest": {
-    "format": 0,
-    "generation": "compatibility-v0-1-1",
-    "documents": 15,
-    "terms": 107,
-    "kinds": [
-      "primary",
-      "alias"
-    ],
-    "lexiconPages": 1,
-    "postingPages": 1,
-    "idPages": 4,
-    "idsPerPage": 4
-  },
-  "pages": {
-    "lexicon": [
-      "fVcxbtwwEPzKQTULrpYUybecr9Cd5TsDF9vQxZADqAkM2x9InzpAAAOp3KVIa9hf8BPyhOAkk0ty6dQ7XC13Z2ap5bLawvj3+7eflajFcimFFLWohRF2tVqJZbWtx0VbCZhitQABxzjFeh/DKWaEodicdg6rKWyjtO3ax/QUAwEUO/PlNFM5SmiK7Suhp5gVSighBa7EUgqYqwMlQBG494kA2cXaz74CmEtwwoXgugvBhtW33oegYT3ZtJXAOWgFChQqSrvZ+YJqYAWdXoZOIyuoW4SgYt/s2pBWs7RduEptCj3qLkLYlsKHkNrx1KGFCKxLZ39++KNYszluiTqq8NlduC5qxp1d6zmATUICJQupzp8ffB1qbvqRKxji+yufTWGardSu/XXgtGVzuNyGoGMTvNr572iZfEeXGtBvfNGaj7TvPMe0mThm4qOHLsiHy/k6sKHher4JWm9mBqKgPj0/3IS8qtDHl8fX2wCYhQtSABHi5XcEsAXA6+3LowcYWQS83gVAXQLcvd4HgCoB7l9+B0CpyLenr29Pv3wbzDzjRjQR4Nfb00MAOAY4+l5gr5WZMeK4aIN9WMhGgOOiDwOyNTvbki9ZzBSHYxtJzqpMcji2xHSb6sZx3eDYEgVdblY4rkn7jleyJpm43K5w3JDBO83K3JAxO5OpCMcNOYOzmTPgeEoKdLkCcexol4GUrKwuWheS37gjpwSJhYZ1JDyQip3f0mRBNoXzu2RlgjTsejvamiAt6/p5JFGQjmkUxz2ZEACkC/R9C6Y17ckv4H0Txi27IisGMNlChkK+njYg1DXrUU/LCmpui0fAgc7nxojjgTYh1IaFr2mLQu3YbW5ImYAyM0CcDI78BxCYfeBkYeRygFjExDYFqEuYu9ipAE0Jcx87KqArYGY7iwwLFGSOhbNj9YTIfOfipGr35+3hpDpayI40pJgKImgkRVAq1eLFSXXVn39q+y8858xCKeRH0Mh5QGWPswS93l93iyx79l5L8JvYP0HZ1JkyaPR4lP+53LaPbUMzSSTgRL+6zvWbYPvu0LX9JvMMnT20kyM3aS+0ThmeYGcezyyMOKbZykxOcbbpbIEm8Jl37xehIy6l3+AZ8v6qbuT05JGhhwPnRZOtpGEiA4WznTRks2+yrTQkA2+yrTQkXG9sHk050LicA0M6eP/yocEPIzXJgzLvHPLpGpVOd/hopIbZz1CYozHpHIfkrxGMjcpZ/QM="
-    ],
-    "postings": [
-      "TYxBDsAgDMNwQaSdUP//3ImOaVNuTmJhcgYNSBHYYIgwkSkYpFe3nonFWYoprC+uX+aU6bNtWXi5RDqv49Rlsf67K6PVKRfeN2i2CmwiCnED"
-    ],
-    "ids": [
-      "i1YyMFTSUTIwAhHGIMJEKRYA",
-      "i1YyMFXSUTIwAxHmIMJCKRYA",
-      "i1YysFTSUTI0ABGGIMJIKRYA",
-      "i1YyNFbSUTI0ARGmSrEA"
-    ]
-  },
+  "description": "Frozen synthetic format-1 pages with independently established query results for rank tiers, multiple name kinds, cross-field words, composed/decomposed accents, Greek sigma, Thai, symbols and case-sensitive matching.",
   "documents": [
     {
       "id": "01",
@@ -175,6 +145,46 @@
       ]
     }
   ],
+  "manifest": {
+    "format": 1,
+    "generation": "format-1-fixture",
+    "documents": 15,
+    "terms": 107,
+    "kinds": [
+      "primary",
+      "alias"
+    ],
+    "directoryPages": 1,
+    "lexiconPages": 3,
+    "descriptorPages": 2,
+    "postingPages": 1,
+    "idPages": 4,
+    "idsPerPage": 4,
+    "descriptorsPerPage": 42
+  },
+  "pages": {
+    "directory": [
+      "i45WSjeuSU0sUtIxiNWJViqvKUotTk0sSs5Q0jGECHyYP2WNko5RbCwA"
+    ],
+    "lexicon": [
+      "ZVMxjsIwEPxK5HqL2JsQeAuicIJJTooOFECicHNCwAeuv/qkk5Co6CiuRckXeMI94WQnZuPQrT3jWe/s7nTKcq7/vj5/GAgIgUMC4xlMWS50IBkIF1cMEhe3dEeTKQPu4oWR4cAhgtjdlQxiEK185C4rQ4y8fHLDYNLFqSLRtKR/ZJIBQmwTOG5WGK2RpzVfkpYK6L0yNUHicZXJ5T6m3vuHtWGPffaGfrb4/TaEiVdvXvUUioCMKqQxgoe+E2/3k/XM2iaAY3dfriwbfXa5pVqWOdW4Kiw79tlVZqX9citlLORtVU/qWlnqxKNuFWXbGee7+H7aGbYIB3+uz83eAmYCeAjcGVXfOkAMgGZfny2AL0BzsEA0BA7N0QLxEDjWNwuMBsDj+vG4XhiMnufL43qisxnnwI036kA+5w11YNxyiKSpRC275ouk133Usu2bGPc7gVq2rcD+hqFOaZhQp9Rb1Fm7Scg98YxWBHVGs4V6TsOAWtHmolbtqqHoMs/+AQ==",
+      "bVNBbsIwEPxK5PMeYjsm8BbgYKibIKUUOSBTiUuFgA/03nOlSpV64sah14p8gSf0CZWdDbEDx90Zr8cz6+GQZHyj1JwATcZQV6UiwIBzoJBCH7uZVh4nj/7e3z7JFc3lhADFYvZ7WLsJCVCgDChHoFjkBARwAQzidlixshdiscil46QhR09zN3IQiNLKF6VVaTlJHHBKJV2XBt2Vito717Ig0Ig8f1XbaueOMKs/Bto8rNpa0EH8Bqp21d5BSRfaVfvzyUGiC+3PJxzY60CX4+vl+H05Hgj0sGUtjzSB1NbzEZHFTJYjspGFM632wes/PGcEBthc6NmT1C8tPb4PTNQSkwywSbFSEZ5kN+hUPv58uGekQCEBcYexvKcl097uBUizREnfX6KAolWppJ4GuxgQ1ij49midZJ0MBjDwAwjI3SgCsA4FlWA2pvGYg7DL2Oyx6VpsnK/oqGltFLS10XjeGS9TE5pnro4J5jtmNq04BqL51ON/",
+      "i45WKq+pSMwpyEhU0jGO1QFxzzefW3+++Xzr+bZz+883K+kY6Zia6BjqGBroGBpCVDzY0fhgx6YHO9qVdMwgIh/mT1kDVmmqY6hjrmMRGwsA"
+    ],
+    "descriptors": [
+      "dZHPCwFRFIUPMxrjxyTJgixYkJIkTZIsSNMkCxYk////oZu7eMl36/Tq67zTefdJ36m6Ekn1H2aKJdWcx4FsIj/tXsWVuWxSyG/63cizUucZ+DvAu8B70L8P/QfQfxjktCS1nY8gZww5E/BPwT+Dd82DvSWBfwH+JfRfBbzh/2GzBr4BngPfAt8B38N/HWBvR9jbCfZwhvwC/CXwC+zzCj1v0PMO/gf4n9DnBfz9h38A",
+      "dc3bBoBQFIThXwel0xsm2ZIkkqTHT5qLfdEsxuKzzALogUSpgJpvBuOj8WB8Mj5HngG5fIm8AVr5ano2IFXe6bR303+Y/jPyAijll/l7/9w/"
+    ],
+    "postings": [
+      "XYtBCgAgEAKbWBJi6f/PDWkPFR4UR0XQgCWCEFY1eayoGCKZl66n+b/XM/W19XQwEBs="
+    ],
+    "ids": [
+      "i1YyMFTSUTIwAhHGIMJEKRYA",
+      "i1YyMFXSUTIwAxHmIMJCKRYA",
+      "i1YysFTSUTI0ABGGIMJIKRYA",
+      "i1YyNFbSUTI0ARGmSrEA"
+    ]
+  },
   "queries": [
     {
       "text": "alpha",

@@ -8,7 +8,7 @@ import {
 } from '../dist/index.js';
 
 const fixture = JSON.parse(readFileSync(
-  new URL('./fixtures/posting-v0-1-1.json', import.meta.url), 'utf8'
+  new URL('./fixtures/posting-format-1.json', import.meta.url), 'utf8'
 ));
 const sources = new Map(fixture.documents.map(row => [row.id, row]));
 
@@ -33,8 +33,8 @@ const checkQueries = async reader => {
   }
 };
 
-test('current index contract reads the frozen 0.1.1 generation', async () => {
-  assert.equal(POSTING_INDEX_COMPATIBILITY_VERSION, 0);
+test('current index contract reads frozen format-1 pages', async () => {
+  assert.equal(POSTING_INDEX_COMPATIBILITY_VERSION, 1);
   assert.equal(fixture.manifest.format, POSTING_INDEX_COMPATIBILITY_VERSION);
   const reader = new PostingReader(fixture.manifest, {
     async readPages(_generation, kind, pages) {
@@ -46,7 +46,7 @@ test('current index contract reads the frozen 0.1.1 generation', async () => {
   await checkQueries(reader);
 });
 
-test('current builder preserves the previous index contract query semantics', async () => {
+test('current builder preserves the frozen query results', async () => {
   const built = buildPostingGeneration(fixture.documents, {
     generation: 'current-compatible-generation',
     kinds: fixture.manifest.kinds,

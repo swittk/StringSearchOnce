@@ -108,10 +108,11 @@ test('builder rejects empty kinds before emitting an unreadable manifest', () =>
 
 test('builder accounts for both lexicon page brackets at the inflation limit', async () => {
   // The exact-name entry is first and its one posting uses byte 0 of page 0.
-  const entryOverhead = Buffer.byteLength(JSON.stringify(['n""|a', 1, [[0, 0, 1, 1, 0, 0]]]));
+  const entryOverhead = Buffer.byteLength(JSON.stringify(['n""|a', 0]));
   const kind = 'k'.repeat(262144 - 2 - entryOverhead);
   const atLimit = fixture([{ id: 'a', names: [name(kind, 'a')] }], { kinds: [kind] });
   await atLimit.reader.open();
+  assert.deepEqual(ids(await atLimit.reader.search(atLimit.options('a'))), ['a']);
   const overLimit = kind + 'k';
   assert.throws(
     () => fixture([{ id: 'a', names: [name(overLimit, 'a')] }], { kinds: [overLimit] }),
@@ -714,4 +715,52 @@ test('aborted worker builds reject and close', async () => {
   const pending = buildPostingGenerationInWorker(documents, { generation: 'abort-fixture', kinds }, controller.signal);
   controller.abort();
   await assert.rejects(pending, /POSTING_BUILD_CANCELLED/);
+});
+
+
+test('opening a large dictionary reads only its sparse fences', async () => {
+  const input = Array.from({ length: 2000 }, (_, index) =>
+    doc(index.toString().padStart(5, '0'), 'entry' + index.toString().padStart(5, '0'))
+  );
+  const f = fixture(input, { pageBytes: 1024, metadataPageBytes: 1024 });
+  assert(f.built.manifest.lexiconPages > 20);
+  await f.reader.open();
+  assert(f.reads.length > 0);
+  assert(f.reads.every(read => read.kind === 'directory'));
+  const result = await f.reader.search(f.options('entry01000', { limit: 1 }));
+  assert.deepEqual(ids(result), ['01000']);
+  const lexiconPages = new Set(f.reads.filter(read => read.kind === 'lexicon').flatMap(read => read.pages));
+  assert(lexiconPages.size < f.built.manifest.lexiconPages / 4);
+  const before = f.reads.length;
+  assert.deepEqual(ids(await f.reader.search(f.options('entry01000', { limit: 1 }))), ['01000']);
+  assert.equal(f.reads.length, before);
+});
+
+test('hot terms seek within paged chunk descriptors and preserve signed continuation', async () => {
+  const input = Array.from({ length: 1200 }, (_, index) =>
+    doc(index.toString().padStart(5, '0'), 'shared phrase')
+  );
+  const f = fixture(input, { chunkIds: 2, pageBytes: 128, metadataPageBytes: 1024 });
+  assert(f.built.manifest.descriptorPages > 100);
+  const options = f.options('shared phrase', {
+    limit: 5, scopeKey: 'all-rows', signingKey: 'example-server-signing-key',
+  });
+  const first = await f.reader.searchPage(options);
+  assert.deepEqual(ids(first), input.slice(0, 5).map(row => row.id));
+  const second = await f.reader.searchPage({ ...options, cursor: first.nextCursor });
+  assert.deepEqual(ids(second), input.slice(5, 10).map(row => row.id));
+  const suffix = await f.reader.searchAfterRank(options, { stage: 'exact', kind: 'title', id: '01100' });
+  assert.deepEqual(ids(suffix), input.slice(1101, 1106).map(row => row.id));
+  const loaded = new Set(f.reads.filter(read => read.kind === 'descriptors').flatMap(read => read.pages));
+  assert(loaded.size < f.built.manifest.descriptorPages / 4);
+});
+
+
+test('singleton terms stay in the dictionary without posting or descriptor reads', async () => {
+  const f = fixture([doc('a', 'Blue desk')]);
+  assert.equal(f.built.manifest.postingPages, 0);
+  assert.equal(f.built.manifest.descriptorPages, 0);
+  for (const text of ['Blue desk', 'desk', 'lue de'])
+    assert.deepEqual(ids(await f.reader.search(f.options(text))), ['a']);
+  assert(!f.reads.some(read => read.kind === 'postings' || read.kind === 'descriptors'));
 });
