@@ -222,19 +222,45 @@ function mergePostingPrefixes<T>(
   return results;
 }
 
-/** One byte-bounded cache per generation. No source objects, session results or ACL decisions live here. */
+/** One retained value and its position in the cache recency order. */
+interface CacheEntry<T> {
+  key: string;
+  value: T;
+  bytes: number;
+  older: CacheEntry<T> | undefined;
+  newer: CacheEntry<T> | undefined;
+}
+
+/** Byte-bounded generation data; cache hits update links without reinserting Map keys. */
 class ByteCache<T> {
-  private entries = new Map<string, { value: T; bytes: number }>();
+  private entries = new Map<string, CacheEntry<T>>();
+  private oldest: CacheEntry<T> | undefined;
+  private newest: CacheEntry<T> | undefined;
   bytes = 0;
   constructor(readonly limit: number) {}
   has(key: string): boolean {
     return this.entries.has(key);
   }
+  private unlink(entry: CacheEntry<T>): void {
+    if (entry.older) entry.older.newer = entry.newer;
+    else this.oldest = entry.newer;
+    if (entry.newer) entry.newer.older = entry.older;
+    else this.newest = entry.older;
+  }
+  private append(entry: CacheEntry<T>): void {
+    entry.older = this.newest;
+    entry.newer = undefined;
+    if (this.newest) this.newest.newer = entry;
+    else this.oldest = entry;
+    this.newest = entry;
+  }
   get(key: string): T | undefined {
     const found = this.entries.get(key);
     if (!found) return undefined;
-    this.entries.delete(key);
-    this.entries.set(key, found);
+    if (found !== this.newest) {
+      this.unlink(found);
+      this.append(found);
+    }
     return found.value;
   }
   put(key: string, value: T, bytes: number): void {
@@ -242,15 +268,19 @@ class ByteCache<T> {
     const previous = this.entries.get(key);
     if (previous) {
       this.bytes -= previous.bytes;
+      this.unlink(previous);
       this.entries.delete(key);
     }
     while (this.bytes + bytes > this.limit) {
-      const oldest = this.entries.keys().next().value;
-      if (oldest === undefined) break;
-      this.bytes -= this.entries.get(oldest)!.bytes;
-      this.entries.delete(oldest);
+      const oldest = this.oldest;
+      if (!oldest) break;
+      this.bytes -= oldest.bytes;
+      this.unlink(oldest);
+      this.entries.delete(oldest.key);
     }
-    this.entries.set(key, { value, bytes });
+    const entry: CacheEntry<T> = { key, value, bytes, older: undefined, newer: undefined };
+    this.entries.set(key, entry);
+    this.append(entry);
     this.bytes += bytes;
   }
 }
