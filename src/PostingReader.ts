@@ -441,7 +441,7 @@ class ListCursor implements Cursor {
   /** Stay synchronous while descriptors are resident; resume only an actual page read. */
   private seekHeaders(target: number, lo: number, hi: number, winning?: PostingChunk): number | Promise<number> {
     while (lo < hi) {
-      const mid = (lo + hi) >>> 1;
+      const mid = lo + Math.floor((hi - lo) / 2);
       const located = this.header(mid);
       if (located instanceof Promise) return this.seekPendingHeader(target, lo, hi, winning, located);
       if (located[5] < target) lo = mid + 1;
@@ -459,7 +459,7 @@ class ListCursor implements Cursor {
     target: number, lo: number, hi: number, winning: PostingChunk | undefined, pending: Promise<PostingChunk>
   ): Promise<number> {
     const header = await pending;
-    const mid = (lo + hi) >>> 1;
+    const mid = lo + Math.floor((hi - lo) / 2);
     return header[5] < target
       ? this.seekHeaders(target, mid + 1, hi, winning)
       : this.seekHeaders(target, lo, mid, header);
