@@ -16,13 +16,13 @@ export async function buildPostingGenerationInWorker(
 ): Promise<BuiltPostingGeneration> {
   if (signal?.aborted) throw new Error('POSTING_BUILD_CANCELLED');
   const workerFile = join(__dirname, 'stringSearchBuilderWorker' + extname(__filename));
-  const { generation, kinds, chunkIds, pageBytes, idsPerPage } = options;
+  const { generation, kinds, chunkIds, pageBytes, idsPerPage, metadataPageBytes } = options;
   // Import the packaged entry from a script so inherited --input-type is valid.
   const workerEntry = `import(${JSON.stringify(pathToFileURL(workerFile).href)})`;
   return new Promise<BuiltPostingGeneration>((resolve, reject) => {
     const worker = new Worker(workerEntry, {
       eval: true,
-      workerData: { options: { generation, kinds: [...kinds], chunkIds, pageBytes, idsPerPage } },
+      workerData: { options: { generation, kinds: [...kinds], chunkIds, pageBytes, idsPerPage, metadataPageBytes } },
       resourceLimits: { maxOldGenerationSizeMb: 1536 },
     });
     let settled = false;

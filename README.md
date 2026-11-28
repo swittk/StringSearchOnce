@@ -11,7 +11,6 @@ database driver, durable queue, or distributed indexing system.
 ## Use
 
 Use Node.js 18.18.0 or later on the 18.x line, or Node.js 20.5.0 or later.
-The initial implementation is under review and has yet to be released on npm.
 Build and test this branch with:
 
 ```sh
@@ -52,40 +51,86 @@ const result = await reader.search({
 console.log(result.results);
 ```
 
-The same API is available from CommonJS. For a large build, use
-`buildPostingGenerationInWorker(rows, options, signal?)` instead of the
-synchronous builder. The worker is included in the package and constructs the
-index off the calling thread. The calling thread copies and serializes the
-selected fields in acknowledged batches of up to 256 rows. Large name values
-can still make a batch expensive to send. Keep `stringsearchonce` external
-when bundling an application. If you inline it, place the packaged worker
-beside the bundle and match its module format and extension. Use a `.js`
-ESM bundle with `stringSearchBuilderWorker.js` or a `.cjs` CommonJS bundle
-with `stringSearchBuilderWorker.cjs`.
+The same API is available from CommonJS. The synchronous builder retains the
+input, posting map and completed pages. `buildPostingGenerationInWorker(rows,
+options, signal?)` moves that build off the calling event loop; it still has the
+array input/output memory contract. The calling thread sends selected fields in
+acknowledged batches of up to 256 rows. Large name values can make a batch
+expensive to send.
+
+For a bounded build, stream documents in strictly ascending ASCII ID order and
+persist each completed page:
+
+```ts
+import { buildPostingGenerationFromOrderedDocuments } from 'stringsearchonce';
+
+const manifest = await buildPostingGenerationFromOrderedDocuments(
+  readDocumentsInIdOrder(),
+  {
+    generation: 'catalog-v2',
+    kinds: ['title'],
+    scratchDirectory: temporaryDirectory,
+    runBytes: 8 * 1024 * 1024,
+    mergeFanIn: 4,
+  },
+  {
+    async writePage(generation, kind, page, bytes) {
+      await saveUnpublishedPage(generation, kind, page, bytes);
+    },
+  },
+);
+```
+
+The builder buffers a bounded run of terms and ordinals, spills sorted runs into
+its own temporary child directory, and merges a bounded number at a time.
+`runBytes` accounts for posting arrays, term strings and their containers; it is
+not a total process-memory limit. One source document is indivisible and can
+exceed the target. Each sink write is awaited before more output is retained.
+The builder removes its temporary child on success or failure. The caller owns
+unpublished page cleanup and publishes the returned manifest only after success.
+Use this function inside a caller-owned worker when the build must not share the
+request event loop.
+
+Keep `stringsearchonce` external when bundling an application. If you inline it,
+place the packaged array-builder worker beside the bundle and match its module
+format and extension. Use a `.js` ESM bundle with `stringSearchBuilderWorker.js`
+or a `.cjs` CommonJS bundle with `stringSearchBuilderWorker.cjs`.
 
 ## Index and storage
 
-A build creates an immutable manifest and three groups of compressed
+A build creates an immutable manifest and five groups of compressed
 `Uint8Array` pages:
 
 | Page kind | Content |
 | --- | --- |
-| lexicon | Sorted terms and pointers to posting chunks |
+| directory | Sparse upper term fences for lexicon pages |
+| lexicon | Sorted terms with inline singleton ordinals or larger-list descriptor ranges |
+| descriptors | Fixed-width posting-chunk locations and ordinal fences |
 | postings | Sorted integer ordinals encoded as delta-varints |
-| ids | Mapping from ordinals to the original IDs |
+| ids | ID lengths and ASCII bytes, addressed by ordinal |
 
 Pages use raw DEFLATE compression. Use a unique generation identifier. Build
 and store all pages. Construct a reader for the stored generation with the
 intended reader options and call `await reader.open()` before making the
-manifest visible. The `maxLexiconBytes` setting defaults to 32 MiB and
-separately caps the decompressed lexicon and the estimated in-memory term
-directory.
+manifest visible. Opening reads only the sparse directory. Exact and multi-gram
+lookups load the needed lexicon blocks; hot terms seek within independently
+paged chunk descriptors instead of loading one large per-term directory. A term
+that occurs in one document stores its ordinal directly in the lexicon, with no
+posting chunk or descriptor. ID pages retain compact bytes and offsets; only
+requested IDs become strings during search.
 
-A `PostingReader` stays bound to one generation. It opens the bounded lexicon
-once, then retrieves posting/ID pages and decodes chunks lazily.
-Page, chunk, and ID caches have separate byte budgets; cache counters report
-cold reads and repeated decodes. The index does not cache source records or
-access decisions across searches.
+A `PostingReader` stays bound to one immutable generation. The default cache
+layout uses 4 MiB for raw pages, 2 MiB for requested IDs, and 36 MiB shared by
+the parsed lexicon, decoded chunks and pinned sparse directory. The directory
+has a 32 MiB admission ceiling; its retained charge is reserved from the shared
+pool. Supplying any byte-budget option retains independent page, chunk, ID
+and lexicon budgets, with omitted values using 4, 4, 2 and 32 MiB respectively.
+In that case, `maxLexiconBytes` bounds the directory plus parsed lexicon.
+These are retained-cache estimates, not a total V8 heap or process-RSS limit:
+active queries also pin the blocks and cursor state they use. Cold loads of the
+same pages are shared within one reader. Reuse a reader across searches of the
+same generation. The index does not cache source records or access decisions
+across searches.
 
 The `PostingPageStore` interface is the only storage boundary. It returns
 binary bytes for the requested page numbers and generation. An adapter
@@ -120,6 +165,14 @@ filters and return at most one current record per requested ID. Deleted,
 denied, and stale-name candidates are excluded before the
 limit; the reader continues to later candidates when needed. Optional
 `filterCandidates` can perform additional eligibility checks.
+When a name-prefix expansion exceeds `maxMatchedTerms`, the reader can nominate
+from complete word-prefix groups instead. If one word group exceeds the limit,
+its whole incomplete expansion is discarded; the remaining complete groups
+supply a candidate superset and current source names still verify every word.
+A complete empty group proves that tier empty. If no complete group is
+available, the request retains the matched-term error. Source and cursor work
+limits still apply to every plan.
+
 A changed name absent from the built snapshot cannot be discovered just by
 rechecking the source rows. Rebuild or provide a live overlay at the application
 layer.
@@ -173,10 +226,12 @@ which exhausted limit is reported first.
 
 `POSTING_INDEX_COMPATIBILITY_VERSION` identifies the stored index contract:
 page encoding plus persisted normalization, token and gram semantics. Its value
-is `0`, matching indexes built by version 0.1.1. Applications can include it in
-their own index fingerprints without rebuilding for unrelated package releases.
-It changes when existing indexes need rebuilding; signed-cursor compatibility is
-tracked separately.
+is `1` for the paged dictionary and descriptor layout. Applications can include
+it in their own index fingerprints without rebuilding for unrelated package
+releases. This format requires rebuilding derived indexes before switching
+readers; it does not read format-0 pages. Keep the publication switch separate
+from page construction, and do not point older readers at the replacement
+manifest. Signed-cursor compatibility is tracked separately.
 
 ## Tests and benchmark
 
@@ -189,6 +244,7 @@ node bench/search.mjs 33000
 
 The tests cover binary pages, Unicode ranking, current-record verification,
 permissions supplied by the caller, signed pagination, cold/warm decoding
+the bounded builder's spill/merge cleanup, lazy dictionary/descriptor reads
 and both module formats' worker entrypoint. The benchmark uses a generated
 catalog and an in-memory page store. Its latency measures the engine and
 callback path, not network or real database latency. No comparative claims

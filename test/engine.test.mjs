@@ -108,10 +108,11 @@ test('builder rejects empty kinds before emitting an unreadable manifest', () =>
 
 test('builder accounts for both lexicon page brackets at the inflation limit', async () => {
   // The exact-name entry is first and its one posting uses byte 0 of page 0.
-  const entryOverhead = Buffer.byteLength(JSON.stringify(['n""|a', 1, [[0, 0, 1, 1, 0, 0]]]));
+  const entryOverhead = Buffer.byteLength(JSON.stringify(['n""|a', 0]));
   const kind = 'k'.repeat(262144 - 2 - entryOverhead);
   const atLimit = fixture([{ id: 'a', names: [name(kind, 'a')] }], { kinds: [kind] });
   await atLimit.reader.open();
+  assert.deepEqual(ids(await atLimit.reader.search(atLimit.options('a'))), ['a']);
   const overLimit = kind + 'k';
   assert.throws(
     () => fixture([{ id: 'a', names: [name(overLimit, 'a')] }], { kinds: [overLimit] }),
@@ -119,7 +120,7 @@ test('builder accounts for both lexicon page brackets at the inflation limit', a
   );
 });
 
-test('reader accepts a full ID page with maximum-length JSON-escaped IDs', async () => {
+test('reader accepts a full ID page with maximum-length punctuation IDs', async () => {
   const input = Array.from({ length: 4096 }, (_, i) => {
     const suffix = i.toString(2).padStart(12, '0').replaceAll('0', '"').replaceAll('1', '\\');
     return { id: '"'.repeat(116) + suffix, names: i === 0 ? [name('title', 'target')] : [] };
@@ -367,9 +368,9 @@ test('rank continuation for a blank query needs no storage', async () => {
 
 test('prefix term limits accept an exact fit and reject the first excess', async () => {
   const f = fixture([
-    doc('a', 'Desk lamp'), doc('b', 'Desk mat'), doc('c', 'Dusk'),
+    doc('a', 'Desk lamp'), doc('b', 'Depart'), doc('c', 'Dusk'),
   ], {}, { maxMatchedTerms: 2 });
-  assert.deepEqual(ids(await f.reader.search(f.options('desk'))), ['a', 'b']);
+  assert.deepEqual(ids(await f.reader.search(f.options('de'))), ['a', 'b']);
   await assert.rejects(f.reader.search(f.options('d')), /POSTING_MATCHED_TERM_LIMIT/);
 });
 
@@ -714,4 +715,164 @@ test('aborted worker builds reject and close', async () => {
   const pending = buildPostingGenerationInWorker(documents, { generation: 'abort-fixture', kinds }, controller.signal);
   controller.abort();
   await assert.rejects(pending, /POSTING_BUILD_CANCELLED/);
+});
+
+
+test('opening a large dictionary reads only its sparse fences', async () => {
+  const input = Array.from({ length: 2000 }, (_, index) =>
+    doc(index.toString().padStart(5, '0'), 'entry' + index.toString().padStart(5, '0'))
+  );
+  const f = fixture(input, { pageBytes: 1024, metadataPageBytes: 1024 });
+  assert(f.built.manifest.lexiconPages > 20);
+  await f.reader.open();
+  assert(f.reads.length > 0);
+  assert(f.reads.every(read => read.kind === 'directory'));
+  const result = await f.reader.search(f.options('entry01000', { limit: 1 }));
+  assert.deepEqual(ids(result), ['01000']);
+  const lexiconPages = new Set(f.reads.filter(read => read.kind === 'lexicon').flatMap(read => read.pages));
+  assert(lexiconPages.size < f.built.manifest.lexiconPages / 4);
+  const before = f.reads.length;
+  assert.deepEqual(ids(await f.reader.search(f.options('entry01000', { limit: 1 }))), ['01000']);
+  assert.equal(f.reads.length, before);
+});
+
+test('hot terms seek within paged chunk descriptors and preserve signed continuation', async () => {
+  const input = Array.from({ length: 1200 }, (_, index) =>
+    doc(index.toString().padStart(5, '0'), 'shared phrase')
+  );
+  const f = fixture(input, { chunkIds: 2, pageBytes: 128, metadataPageBytes: 1024 });
+  assert(f.built.manifest.descriptorPages > 100);
+  const options = f.options('shared phrase', {
+    limit: 5, scopeKey: 'all-rows', signingKey: 'example-server-signing-key',
+  });
+  const first = await f.reader.searchPage(options);
+  assert.deepEqual(ids(first), input.slice(0, 5).map(row => row.id));
+  const second = await f.reader.searchPage({ ...options, cursor: first.nextCursor });
+  assert.deepEqual(ids(second), input.slice(5, 10).map(row => row.id));
+  const suffix = await f.reader.searchAfterRank(options, { stage: 'exact', kind: 'title', id: '01100' });
+  assert.deepEqual(ids(suffix), input.slice(1101, 1106).map(row => row.id));
+  const loaded = new Set(f.reads.filter(read => read.kind === 'descriptors').flatMap(read => read.pages));
+  assert(loaded.size < f.built.manifest.descriptorPages / 4);
+});
+
+
+test('singleton terms stay in the dictionary without posting or descriptor reads', async () => {
+  const f = fixture([doc('a', 'Blue desk')]);
+  assert.equal(f.built.manifest.postingPages, 0);
+  assert.equal(f.built.manifest.descriptorPages, 0);
+  for (const text of ['Blue desk', 'desk', 'lue de'])
+    assert.deepEqual(ids(await f.reader.search(f.options(text))), ['a']);
+  assert(!f.reads.some(read => read.kind === 'postings' || read.kind === 'descriptors'));
+});
+
+test('complete word groups preserve broad prefix ranks, source freshness and signed continuation', async () => {
+  const cases = [
+    {text:'Common Name', rows:Array.from({length:48},(_,i)=>doc(String(i).padStart(6,'0'),(i%2?'Common Name ':'Common   Name ')+i,i%7?'blue field':'Common Name'))},
+    {text:'ส', rows:Array.from({length:48},(_,i)=>doc(String(i).padStart(6,'0'),(i%2?'สมชาย ':'สุดา ')+i,i%3?'alias':'สมสุข'))},
+    {text:'J', caseSensitive:true, rows:Array.from({length:48},(_,i)=>doc(String(i).padStart(6,'0'),'J\u030cZ '+i,'blue field'))},
+  ];
+  for (const item of cases) {
+    const control=fixture(item.rows);
+    const bounded=fromBuilt(control.built,item.rows,{maxMatchedTerms:5});
+    const current=new Map(item.rows.map(r=>[r.id,r]));
+    let cursor;
+    do {
+      const options=control.options(item.text,{
+        caseSensitive:item.caseSensitive,limit:7,batchSize:20,
+        maxSourceCandidates:12000,maxCursorSteps:1000000,cursor,
+        signingKey:'complete-word-test-signing-key',scopeKey:'fixed-source-policy',
+        fetchSources:async wanted=>wanted.flatMap(id=>current.has(id)?[current.get(id)]:[]),
+      });
+      const expected=await control.reader.searchPage(options);
+      const actual=await bounded.reader.searchPage(options);
+      assert.deepEqual(actual.results,expected.results);
+      assert.equal(actual.nextCursor,expected.nextCursor);
+      assert.equal(actual.coverage,expected.coverage);
+      cursor=actual.nextCursor;
+      if(cursor){
+        current.delete('000031');
+        const unseen=item.rows.find(r=>r.id>actual.results.at(-1).object.id);
+        if(unseen)current.set(unseen.id,doc(unseen.id,'renamed away','different alias'));
+      }
+    } while(cursor);
+  }
+});
+
+test('an overflowing word constraint is dropped whole while complete groups remain exhaustive', async () => {
+  const input=Array.from({length:96},(_,i)=>doc(String(i).padStart(6,'0'),
+    (i%2?'Common Unique':'Common   Unique')+i,i%13===0?'Needle target':'Needle'+i));
+  input.push(doc('000096','Unique suffix','Xabsent'));
+  const f=fixture(input,{}, {maxMatchedTerms:5});
+  for(const text of ['Common Uni','Uni target','Uni absent','Uni Needle95']){
+    const expected=oracle(input,text),found=[];
+    let cursor;
+    do{
+      const page=await f.reader.searchPage(f.options(text,{
+        limit:7,batchSize:20,maxSourceCandidates:12000,maxCursorSteps:1000000,
+        signingKey:'complete-word-test-signing-key',scopeKey:'all-readable',cursor,
+      }));
+      found.push(...ids(page));cursor=page.nextCursor;
+    }while(cursor);
+    assert.deepEqual(found,expected,text);
+  }
+  // The absent word-prefix is a complete empty group, but its internal substring
+  // still belongs to a later tier.
+  assert.deepEqual(ids(await f.reader.search(f.options('Uni absent'))),['000096']);
+  assert.deepEqual(ids(await f.reader.search(f.options('Uni Needle95'))),['000095']);
+  await assert.rejects(f.reader.search(f.options('Uni')),/POSTING_MATCHED_TERM_LIMIT/);
+  await assert.rejects(f.reader.searchPage(f.options('Common Uni',{
+    limit:7,batchSize:20,maxSourceCandidates:20,maxCursorSteps:1000000,
+    signingKey:'complete-word-test-signing-key',scopeKey:'no-readable',
+    fetchSources:async()=>[],
+  })),/POSTING_SOURCE_CANDIDATE_LIMIT/);
+});
+
+test('prefix nomination preserves genuine page-store failures and settles all started reads', async () => {
+  const input=Array.from({length:48},(_,i)=>doc(String(i).padStart(6,'0'),'Common Unique'+i,'needle'+i));
+  const built=buildPostingGeneration(input,{
+    generation:'prefix-failure',kinds,chunkIds:8,pageBytes:1024,idsPerPage:16,metadataPageBytes:256,
+  });
+  const wordPage=built.pages.get('lexicon').findIndex(bytes=>
+    JSON.parse(Buffer.from(unpackPostingPage(bytes,262144)).toString('utf8'))
+      .some(entry=>entry[0]==='w|common'));
+  assert(wordPage>=0);
+  for(const failure of [new Error('POSTING_MATCHED_TERM_LIMIT'),undefined]){
+    let inFlight=0,settled=0;
+    const reader=new PostingReader(built.manifest,{
+      async readPages(generation,kind,pages){
+        inFlight++;
+        try{
+          await new Promise(resolve=>setImmediate(resolve));
+          if(kind==='lexicon'&&pages.includes(wordPage))throw failure;
+          return new Map(pages.map(page=>[page,built.pages.get(kind)[page]]));
+        }finally{inFlight--;settled++;}
+      }
+    },{maxMatchedTerms:5});
+    const rows=new Map(input.map(r=>[r.id,r]));
+    let rejected=false;
+    try{
+      await reader.search({
+        text:'Common Uni',limit:50,fetchSources:async wanted=>wanted.map(id=>rows.get(id)),
+        getId:r=>r.id,getNames:r=>r.names,
+      });
+    }catch(error){rejected=true;assert.equal(error,failure);}
+    assert(rejected);assert.equal(inFlight,0);assert(settled>0);
+  }
+});
+
+
+test('compact ID pages preserve variable lengths, punctuation and absent rank boundaries', async () => {
+  const objectIds = ['!', '!!', '"', '"quoted"', 'A'.repeat(127), 'A'.repeat(128), '\\', '~'].sort();
+  const input = objectIds.map(id => doc(id, 'Needle'));
+  const f = fixture(input, { idsPerPage: 3 });
+  const enumerated = [];
+  for await (const batch of f.reader.idBatches()) enumerated.push(...batch);
+  assert.deepEqual(enumerated, objectIds);
+  assert.deepEqual(ids(await f.reader.search(f.options('needle', { limit: 20 }))), objectIds);
+  for (const boundary of ['!"', 'A'.repeat(126), 'Z']) {
+    const suffix = await f.reader.searchAfterRank(f.options('needle', { limit: 20 }), {
+      stage: 'exact', kind: 'title', id: boundary,
+    });
+    assert.deepEqual(ids(suffix), objectIds.filter(id => id > boundary));
+  }
 });

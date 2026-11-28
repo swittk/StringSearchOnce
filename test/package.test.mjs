@@ -18,7 +18,7 @@ test('packed artifact works outside the checkout, with ESM/CJS workers and decla
     writeFileSync(join(dir,'package.json'), '{"name":"consumer-test","private":true,"type":"module"}');
     run('npm', ['install', '--offline', '--ignore-scripts', '--no-audit', '--no-fund', join(dir,packed.filename)]);
     const body = `
-if (POSTING_INDEX_COMPATIBILITY_VERSION !== 0) throw Error('Bad index compatibility export');
+if (POSTING_INDEX_COMPATIBILITY_VERSION !== 1) throw Error('Bad index compatibility export');
 const rows = [{id:'01', names:[{kind:'title',text:'Blue desk'}]}];
 const built = await buildPostingGenerationInWorker(rows,{generation:'test',kinds:['title']});
 const reader = new PostingReader(built.manifest,{
@@ -38,10 +38,27 @@ const page = await PostingReader.searchCompositePage([reader], {
   ...search, scopeKey:'catalog', signingKey:'example-server-signing-key',
 });
 if (page.results[0]?.object.id !== '01') throw Error('Bad composite result');
+const streamedPages = new Map();
+const streamedManifest = await buildPostingGenerationFromOrderedDocuments(
+  (async function* () { yield* rows; })(),
+  {generation:'streamed',kinds:['title'],scratchDirectory:'.',runBytes:1024,mergeFanIn:2},
+  {async writePage(_generation,kind,page,bytes) {
+    let pages=streamedPages.get(kind);
+    if (!pages) { pages=[]; streamedPages.set(kind,pages); }
+    pages[page]=bytes;
+  }}
+);
+const streamedReader = new PostingReader(streamedManifest,{
+  async readPages(_generation,kind,pages) {
+    return new Map(pages.map(page=>[page,streamedPages.get(kind)[page]]));
+  }
+});
+if ((await streamedReader.search(search)).results[0]?.object.id !== '01')
+  throw Error('Bad streamed consumer result');
 `;
-    const esm = `import {POSTING_INDEX_COMPATIBILITY_VERSION,buildPostingGenerationInWorker,PostingReader} from 'stringsearchonce';\n` + body;
+    const esm = `import {POSTING_INDEX_COMPATIBILITY_VERSION,buildPostingGenerationInWorker,buildPostingGenerationFromOrderedDocuments,PostingReader} from 'stringsearchonce';\n` + body;
     writeFileSync(join(dir,'esm.mjs'), esm);
-    writeFileSync(join(dir,'cjs.cjs'), `const {POSTING_INDEX_COMPATIBILITY_VERSION,buildPostingGenerationInWorker,PostingReader}=require('stringsearchonce');
+    writeFileSync(join(dir,'cjs.cjs'), `const {POSTING_INDEX_COMPATIBILITY_VERSION,buildPostingGenerationInWorker,buildPostingGenerationFromOrderedDocuments,PostingReader}=require('stringsearchonce');
 (async()=>{
 ${body}
 })().catch(e=>{console.error(e);process.exitCode=1});`);
@@ -56,7 +73,7 @@ ${body}
       input: esm, stdio: ['pipe', 'pipe', 'pipe'],
     });
     const typed = `
-const indexCompatibility: 0 = POSTING_INDEX_COMPATIBILITY_VERSION;
+const indexCompatibility: 1 = POSTING_INDEX_COMPATIBILITY_VERSION;
 const rows: PostingDocument[] = [{id:'01',names:[{kind:'title',text:'Desk'}]}];
 const built = buildPostingGeneration(rows,{generation:'test',kinds:['title']});
 const store: PostingPageStore = {async readPages(_generation,kind,pages) {
@@ -64,13 +81,20 @@ const store: PostingPageStore = {async readPages(_generation,kind,pages) {
 }};
 const reader = new PostingReader(built.manifest,store);
 const batches: AsyncIterable<readonly string[]> = reader.idBatches();
+const buildOptions: BuildOrderedPostingOptions = {
+  generation:'streamed',kinds:['title'],scratchDirectory:'.',runBytes:1024,mergeFanIn:2,
+};
+const sink: PostingPageSink = {async writePage(_generation,_kind,_page,_bytes) {}};
+const manifest: Promise<PostingManifest> = buildPostingGenerationFromOrderedDocuments(
+  (async function* () { yield* rows; })(), buildOptions, sink
+);
 const page: Promise<PostingCompositePageResult<PostingDocument>> = PostingReader.searchCompositePage([reader],{
   text:'desk',fetchSources:async()=>rows,getId:row=>row.id,getNames:row=>row.names,
   scopeKey:'catalog',signingKey:'example-server-signing-key',
   readLive:async(after,limit)=>after?.id === '01' || !limit ? [] : [{object:rows[0],stage:'exact',kind:'title'}],
 });
 `;
-    const imports = `import {POSTING_INDEX_COMPATIBILITY_VERSION,buildPostingGeneration,PostingReader,type PostingDocument,type PostingPageStore,type PostingCompositePageResult} from 'stringsearchonce';
+    const imports = `import {POSTING_INDEX_COMPATIBILITY_VERSION,buildPostingGeneration,buildPostingGenerationFromOrderedDocuments,PostingReader,type PostingDocument,type PostingPageStore,type PostingPageSink,type PostingManifest,type BuildOrderedPostingOptions,type PostingCompositePageResult} from 'stringsearchonce';
 `;
     writeFileSync(join(dir,'typed.mts'), imports + typed);
     writeFileSync(join(dir,'typed.cts'), imports + typed);
