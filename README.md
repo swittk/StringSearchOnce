@@ -119,9 +119,13 @@ that occurs in one document stores its ordinal directly in the lexicon, with no
 posting chunk or descriptor. ID pages retain compact bytes and offsets; only
 requested IDs become strings during search.
 
-A `PostingReader` stays bound to one immutable generation. `maxLexiconBytes`
-defaults to 32 MiB and bounds the estimated retained directory plus parsed
-lexicon cache. The page, chunk and ID caches have separate byte budgets.
+A `PostingReader` stays bound to one immutable generation. The default cache
+layout uses 4 MiB for raw pages, 2 MiB for requested IDs, and 36 MiB shared by
+the parsed lexicon, decoded chunks and pinned sparse directory. The directory
+has a 32 MiB admission ceiling; its retained charge is reserved from the shared
+pool. Supplying any byte-budget option retains independent page, chunk, ID
+and lexicon budgets, with omitted values using 4, 4, 2 and 32 MiB respectively.
+In that case, `maxLexiconBytes` bounds the directory plus parsed lexicon.
 These are retained-cache estimates, not a total V8 heap or process-RSS limit:
 active queries also pin the blocks and cursor state they use. Cold loads of the
 same pages are shared within one reader. Reuse a reader across searches of the

@@ -1,4 +1,9 @@
+import { compactPostingChunk, copyPostingChunkRange, countPostingChunkRange, postingChunkOrdinal, postingChunkOrdinals, seekPostingChunk, type PostingChunkValues } from './postingChunkValues';
 import { decodePostingObjectIds, postingObjectIdAt, type PostingObjectIdPage } from './postingObjectIds';
+import {
+  cachePostingObjectId, cachedPostingObjectId, postingObjectIdBlockBytes, postingObjectIdBlockSize,
+  type PostingObjectIdBlock,
+} from './postingObjectIdCache';
 import {
   POSTING_INDEX_COMPATIBILITY_VERSION, postingDescriptorAt as descriptorAt,
   comparePostingIds, decodePostingIds, foldPostingText, postingGrams,
@@ -21,6 +26,14 @@ function isPostingTerm(value: unknown): value is PostingTerm {
   for (let field = 1; field < value.length; field++)
     if (!Number.isSafeInteger(value[field]) || value[field] < 0) return false;
   return true;
+}
+
+// A failed shared read must not release a request while its other callbacks run.
+function completeReads<T>(reads: readonly Promise<T>[]): Promise<T[]> {
+  return Promise.all(reads).catch(async (error: unknown) => {
+    await Promise.allSettled(reads);
+    throw error;
+  });
 }
 
 const ordinaryPostingCharacter = /^[^\p{S}]$/u;
@@ -222,121 +235,284 @@ function mergePostingPrefixes<T>(
   return results;
 }
 
-/** One retained value and its position in the cache recency order. */
-interface CacheEntry<T> {
-  key: string;
-  value: T;
+/** Each value belongs to one typed cache and one shared recency budget. */
+interface CacheLink {
+  key: string | number;
   bytes: number;
-  older: CacheEntry<T> | undefined;
-  newer: CacheEntry<T> | undefined;
+  owner: { evict(key: string | number, bytes: number): void };
+  older: CacheLink | undefined;
+  newer: CacheLink | undefined;
+}
+interface CacheEntry<T> extends CacheLink {
+  value: T;
 }
 
-/** Byte-bounded generation data; cache hits update links without reinserting Map keys. */
-class ByteCache<T> {
-  private entries = new Map<string, CacheEntry<T>>();
-  private oldest: CacheEntry<T> | undefined;
-  private newest: CacheEntry<T> | undefined;
+/** One byte limit and recency order, optionally shared by several cache kinds. */
+class CacheBudget {
+  private oldest: CacheLink | undefined;
+  private newest: CacheLink | undefined;
   bytes = 0;
-  constructor(readonly limit: number) {}
-  has(key: string): boolean {
-    return this.entries.has(key);
-  }
-  private unlink(entry: CacheEntry<T>): void {
+  constructor(public limit: number) {}
+  private unlink(entry: CacheLink): void {
     if (entry.older) entry.older.newer = entry.newer;
     else this.oldest = entry.newer;
     if (entry.newer) entry.newer.older = entry.older;
     else this.newest = entry.older;
   }
-  private append(entry: CacheEntry<T>): void {
+  private append(entry: CacheLink): void {
     entry.older = this.newest;
     entry.newer = undefined;
     if (this.newest) this.newest.newer = entry;
     else this.oldest = entry;
     this.newest = entry;
   }
-  get(key: string): T | undefined {
+  resize(limit: number): void {
+    this.limit = limit;
+    while (this.bytes > limit) this.remove(this.oldest!);
+  }
+  touch(entry: CacheLink): void {
+    if (entry !== this.newest) {
+      this.unlink(entry);
+      this.append(entry);
+    }
+  }
+  remove(entry: CacheLink): void {
+    this.unlink(entry);
+    this.bytes -= entry.bytes;
+    entry.owner.evict(entry.key, entry.bytes);
+  }
+  add(entry: CacheLink): void {
+    while (this.bytes + entry.bytes > this.limit) this.remove(this.oldest!);
+    this.append(entry);
+    this.bytes += entry.bytes;
+  }
+}
+
+type PostingCachedPage = Uint8Array | PostingObjectIdPage;
+function postingCachedPageBytes(page: PostingCachedPage): Uint8Array {
+  if (page instanceof Uint8Array) return page;
+  const { bytes } = page;
+  return new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+}
+
+/** Byte-bounded generation data; cache hits update links without reinserting Map keys. */
+class ByteCache<T> {
+  private entries = new Map<string | number, CacheEntry<T>>();
+  bytes = 0;
+  constructor(readonly limit: number, private budget = new CacheBudget(limit)) {}
+  has(key: string | number): boolean {
+    return this.entries.has(key);
+  }
+  get(key: string | number): T | undefined {
     const found = this.entries.get(key);
     if (!found) return undefined;
-    if (found !== this.newest) {
-      this.unlink(found);
-      this.append(found);
-    }
+    this.budget.touch(found);
     return found.value;
   }
-  put(key: string, value: T, bytes: number): void {
-    if (bytes > this.limit) return;
+  evict(key: string | number, bytes: number): void {
+    this.entries.delete(key);
+    this.bytes -= bytes;
+  }
+  put(key: string | number, value: T, bytes: number): void {
+    if (bytes > this.limit || bytes > this.budget.limit) return;
     const previous = this.entries.get(key);
-    if (previous) {
-      this.bytes -= previous.bytes;
-      this.unlink(previous);
-      this.entries.delete(key);
-    }
-    while (this.bytes + bytes > this.limit) {
-      const oldest = this.oldest;
-      if (!oldest) break;
-      this.bytes -= oldest.bytes;
-      this.unlink(oldest);
-      this.entries.delete(oldest.key);
-    }
-    const entry: CacheEntry<T> = { key, value, bytes, older: undefined, newer: undefined };
+    if (previous) this.budget.remove(previous);
+    const entry: CacheEntry<T> = { key, value, bytes, owner: this, older: undefined, newer: undefined };
     this.entries.set(key, entry);
-    this.append(entry);
     this.bytes += bytes;
+    this.budget.add(entry);
   }
 }
 
 /** A cursor yields ordinals in increasing order; Infinity means there are no more. */
 interface Cursor {
   peek(): number;
-  seek(target: number): Promise<number>;
+  seek(target: number): number | Promise<number>;
 }
 const emptyCursor = (): Cursor => ({ peek: () => Infinity, seek: async () => Infinity });
+
+/** Locate the first ordinal at or after target in a sorted decoded chunk. */
+function postingOrdinalLowerBound(values: Uint32Array, target: number): number {
+  let lo = 0, hi = values.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (values[mid]! < target) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
 
 /** Same ordinal-fence seek, with bounded descriptor pages instead of a materialized hot list. */
 class ListCursor implements Cursor {
   private position = 0;
   private current: number;
   private currentHeader?: PostingChunk;
+  private retainCurrent = false;
+  private residentIds?: PostingChunkValues;
+  private residentOffset = 0;
+  private residentBitmap = false;
+  private residentBase = 0;
   constructor(
     private term: PostingTerm,
     private header: (index: number) => PostingChunk | Promise<PostingChunk>,
-    private load: (chunk: PostingChunk) => Uint32Array | Promise<Uint32Array>,
+    private load: (chunk: PostingChunk) => PostingChunkValues | Promise<PostingChunkValues>,
     private tick: () => void
   ) {
     this.current = term.length === 2 ? term[1] : term[4];
   }
+  retainCurrentChunk(): void {
+    this.retainCurrent = true;
+  }
+  clearCurrentChunk(): void {
+    this.residentIds = undefined;
+    this.residentOffset = 0;
+  }
+  private loadCurrentChunk(chunk: PostingChunk): PostingChunkValues | Promise<PostingChunkValues> {
+    if (!this.retainCurrent || chunk !== this.currentHeader) return this.load(chunk);
+    if (this.residentIds) return this.residentIds;
+    const loaded = this.load(chunk);
+    if (loaded instanceof Promise)
+      return loaded.then((ids) => {
+        if (this.currentHeader === chunk) this.setCurrentChunk(chunk, ids);
+        return ids;
+      });
+    this.setCurrentChunk(chunk, loaded);
+    return loaded;
+  }
+  private setCurrentChunk(chunk: PostingChunk, ids: PostingChunkValues): void {
+    this.residentIds = ids;
+    this.residentBitmap = ids.length < chunk[3];
+    this.residentBase = this.residentBitmap || ids instanceof Uint16Array ? chunk[4] : 0;
+  }
   peek(): number { return this.current; }
-  async seek(target: number): Promise<number> {
+  /** Known chunk data can advance without creating another promise or cache lookup. */
+  seekLocal(target: number): number | Promise<number> {
+    if (this.current >= target) return this.current;
+    const ids = this.residentIds;
+    if (!ids || this.currentHeader![5] < target) return this.seek(target);
+    this.tick();
+    const chunk = this.currentHeader!;
+    if (this.residentBitmap) {
+      const offset = target - this.residentBase;
+      if (ids[offset >>> 5]! & (1 << (offset & 31))) {
+        this.residentOffset = offset;
+        return (this.current = target);
+      }
+    } else {
+      const next = this.residentOffset + 1;
+      const ordinal = ids[next]! + this.residentBase;
+      if (ordinal >= target) {
+        this.residentOffset = next;
+        return (this.current = ordinal);
+      }
+    }
+    this.residentOffset = seekPostingChunk(ids, chunk, target, this.residentOffset + 1);
+    return (this.current = postingChunkOrdinal(ids, chunk, this.residentOffset));
+  }
+  seek(target: number): number | Promise<number> {
     if (this.current >= target) return this.current;
     this.tick();
-    if (this.term.length === 2) return (this.current = Infinity);
-    if (target > this.term[5]) return (this.current = Infinity);
-    let chunk = this.currentHeader;
-    if (!chunk || chunk[5] < target) {
-      let lo = this.position, hi = this.term[3];
-      while (lo < hi) {
-        const mid = (lo + hi) >>> 1;
-        const located = this.header(mid);
-        const header = located instanceof Promise ? await located : located;
-        if (header[5] < target) lo = mid + 1;
-        else hi = mid;
+    if (this.term.length === 2 || target > this.term[5]) {
+      if (this.retainCurrent) this.clearCurrentChunk();
+      return (this.current = Infinity);
+    }
+    const chunk = this.currentHeader;
+    if (chunk && chunk[5] >= target) return this.seekCurrentChunk(target, chunk);
+    if (this.retainCurrent) this.clearCurrentChunk();
+    const lo = this.position, hi = this.term[3];
+    if (chunk && lo + 1 < hi) {
+      const next = this.header(lo + 1);
+      return next instanceof Promise
+        ? next.then((value) => this.seekAfterNextHeader(target, lo + 1, hi, value))
+        : this.seekAfterNextHeader(target, lo + 1, hi, next);
+    }
+    return this.seekHeaders(target, chunk ? lo + 1 : lo, hi);
+  }
+  private seekAfterNextHeader(target: number, index: number, end: number, chunk: PostingChunk): number | Promise<number> {
+    if (chunk[5] < target) return this.seekHeaders(target, index + 1, end);
+    this.position = index;
+    this.currentHeader = chunk;
+    return this.seekCurrentChunk(target, chunk);
+  }
+  /** Stay synchronous while descriptors are resident; resume only an actual page read. */
+  private seekHeaders(target: number, lo: number, hi: number, winning?: PostingChunk): number | Promise<number> {
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      const located = this.header(mid);
+      if (located instanceof Promise)
+        return located.then((header) => header[5] < target
+          ? this.seekHeaders(target, mid + 1, hi, winning)
+          : this.seekHeaders(target, lo, mid, header));
+      if (located[5] < target) lo = mid + 1;
+      else {
+        hi = mid;
+        winning = located;
       }
-      this.position = lo;
-      if (lo >= this.term[3]) return (this.current = Infinity);
-      const located = this.header(lo);
+    }
+    this.position = lo;
+    if (lo >= this.term[3]!) return (this.current = Infinity);
+    this.currentHeader = winning!;
+    return this.seekCurrentChunk(target, winning!);
+  }
+  private seekCurrentChunk(target: number, chunk: PostingChunk): number | Promise<number> {
+    if (chunk[4] >= target) return (this.current = chunk[4]);
+    const loaded = this.retainCurrent ? this.loadCurrentChunk(chunk) : this.load(chunk);
+    return loaded instanceof Promise
+      ? loaded.then((ids) => this.seekLoadedChunk(target, chunk, ids))
+      : this.seekLoadedChunk(target, chunk, loaded);
+  }
+  private seekLoadedChunk(target: number, chunk: PostingChunk, ids: PostingChunkValues): number {
+    const position = seekPostingChunk(ids, chunk, target, this.retainCurrent ? this.residentOffset : 0);
+    if (this.retainCurrent) this.residentOffset = position;
+    return (this.current = postingChunkOrdinal(ids, chunk, position));
+  }
+  async membershipWindow(target: number): Promise<{ values: Uint32Array; upper: number } | undefined> {
+    const first = await this.seek(target);
+    if (first === Infinity) return undefined;
+    this.tick();
+    if (this.term.length === 2) return { values: Uint32Array.of(first), upper: first };
+    let chunk = this.currentHeader;
+    if (!chunk) {
+      const located = this.header(this.position);
       chunk = located instanceof Promise ? await located : located;
       this.currentHeader = chunk;
     }
-    if (chunk[4] >= target) return (this.current = chunk[4]);
-    const loaded = this.load(chunk);
-    const ids = loaded instanceof Promise ? await loaded : loaded;
-    let left = 0, right = ids.length;
-    while (left < right) {
-      const mid = (left + right) >>> 1;
-      if (ids[mid]! < target) left = mid + 1;
-      else right = mid;
+    const loaded = this.loadCurrentChunk(chunk);
+    const values = postingChunkOrdinals(loaded instanceof Promise ? await loaded : loaded, chunk, first);
+    return { values, upper: chunk[5] };
+  }
+  /** Stop counting as soon as this list cannot improve the current local candidate set. */
+  async smallerMembershipWindow(lower: number, upper: number, bestCount: number): Promise<Uint32Array | undefined> {
+    this.tick();
+    const first = await this.seek(lower);
+    if (first > upper) return new Uint32Array(0);
+    if (bestCount <= 1) return undefined;
+    if (this.term.length === 2) return Uint32Array.of(first);
+    let count = 0, buffer: Uint32Array | undefined;
+    for (let index = this.position; index < this.term[3]; index++) {
+      this.tick();
+      const located = index === this.position && this.currentHeader ? this.currentHeader : this.header(index);
+      const header = located instanceof Promise ? await located : located;
+      if (header[4] > upper) break;
+      let values: PostingChunkValues | undefined, length = header[3];
+      if (header[4] < lower || header[5] > upper) {
+        const loaded = this.loadCurrentChunk(header);
+        values = loaded instanceof Promise ? await loaded : loaded;
+        length = countPostingChunkRange(values, header, lower, upper, bestCount - count);
+      }
+      if (count + length >= bestCount) return undefined;
+      if (length) {
+        if (!values) {
+          const loaded = this.loadCurrentChunk(header);
+          values = loaded instanceof Promise ? await loaded : loaded;
+        }
+        buffer ??= new Uint32Array(bestCount - 1);
+        copyPostingChunkRange(values, header, lower, upper, buffer, count);
+        count += length;
+      }
+      if (header[5] >= upper) break;
     }
-    return (this.current = ids[left] ?? Infinity);
+    return buffer ? buffer.subarray(0, count) : new Uint32Array(0);
   }
 }
 
@@ -403,6 +579,121 @@ class IntersectionCursor implements Cursor {
   }
 }
 
+/** Intersect singleton term groups within one bounded anchor chunk at a time. */
+class LocalMembershipIntersectionCursor implements Cursor {
+  private current = -1;
+  private values: Uint32Array = new Uint32Array(0);
+  private position = 0;
+  private upper = -1;
+  private nextTarget = 0;
+  private driver = 0;
+  constructor(private cursors: ListCursor[], private tick: () => void) {
+    for (const cursor of cursors) cursor.retainCurrentChunk();
+  }
+  private exhaust(): number {
+    for (const cursor of this.cursors) cursor.clearCurrentChunk();
+    return (this.current = Infinity);
+  }
+  peek(): number { return this.current; }
+  seek(target: number): number | Promise<number> {
+    if (this.current >= target) return this.current;
+    while (this.position < this.values.length) {
+      const candidate = this.values[this.position++]!;
+      if (candidate < target) continue;
+      this.tick();
+      const located = this.probeCandidate(candidate, 0);
+      if (located instanceof Promise) return this.resumeSeek(target, located);
+      if (located !== undefined) return located;
+    }
+    return this.resumeSeek(target, this.prepareWindow(target));
+  }
+  private resumeSeek(target: number, pending: Promise<number | undefined>): Promise<number> {
+    return pending.then((value) => value === undefined ? this.seek(target) : value);
+  }
+  /** Buffered candidates need no promise unless a probe actually reads another page. */
+  private probeCandidate(candidate: number, from: number): number | undefined | Promise<number | undefined> {
+    for (let index = from; index < this.cursors.length; index++) {
+      if (index === this.driver) continue;
+      this.tick();
+      const located = this.cursors[index]!.seekLocal(candidate);
+      if (located instanceof Promise) return this.resumeProbe(candidate, index + 1, located);
+      if (located === Infinity) return this.exhaust();
+      if (this.rejectCandidate(candidate, located)) return undefined;
+    }
+    return (this.current = candidate);
+  }
+  private resumeProbe(candidate: number, next: number, pending: Promise<number>): Promise<number | undefined> {
+    return pending.then((value) => {
+      if (value === Infinity) return this.exhaust();
+      return this.rejectCandidate(candidate, value) ? undefined : this.probeCandidate(candidate, next);
+    });
+  }
+  private rejectCandidate(candidate: number, value: number): boolean {
+    if (value <= candidate) return false;
+    if (value > this.upper) {
+      this.position = this.values.length;
+      this.nextTarget = Math.max(this.nextTarget, value);
+    } else {
+      while (this.position < this.values.length && this.values[this.position]! < value) {
+        this.tick();
+        this.position++;
+      }
+    }
+    return true;
+  }
+  private async prepareWindow(target: number): Promise<number | undefined> {
+    let lower = Math.max(target, this.nextTarget);
+    for (;;) {
+      this.values = new Uint32Array(0);
+      this.position = 0;
+      lower = Math.max(lower, target, this.nextTarget);
+      this.tick();
+      const known = this.cursors[0]!.peek();
+      if (known >= lower) {
+        let same = true;
+        for (let index = 1; index < this.cursors.length; index++) {
+          this.tick();
+          if (this.cursors[index]!.peek() !== known) {
+            same = false;
+            break;
+          }
+        }
+        if (same) {
+          this.nextTarget = known + 1;
+          return known === Infinity ? this.exhaust() : (this.current = known);
+        }
+      }
+      let window = await this.cursors[0]!.membershipWindow(lower);
+      if (!window) return this.exhaust();
+      let values = window.values;
+      this.upper = window.upper;
+      this.nextTarget = this.upper + 1;
+      window = undefined;
+      lower = values[0]!;
+      for (let index = 1; index < this.cursors.length; index++) {
+        this.tick();
+        const located = this.cursors[index]!.seekLocal(lower);
+        const value = located instanceof Promise ? await located : located;
+        if (value === Infinity) return this.exhaust();
+        if (value > lower) lower = value;
+      }
+      if (lower > this.upper) continue;
+      values = values.subarray(postingOrdinalLowerBound(values, lower));
+      this.driver = 0;
+      for (let index = 1; index < this.cursors.length; index++) {
+        const smaller = await this.cursors[index]!.smallerMembershipWindow(lower, this.upper, values.length);
+        if (smaller) {
+          values = smaller;
+          this.driver = index;
+          if (!values.length) break;
+        }
+      }
+      this.values = values;
+      return undefined;
+    }
+  }
+}
+
 /**
  * Read one immutable generation. The lexicon contains terms and page offsets,
  * not source objects. Live write/delete capture is deliberately not claimed here.
@@ -412,12 +703,14 @@ export class PostingReader {
   private lexiconCache: ByteCache<readonly PostingTerm[]>;
   private readonly pendingLexicon = new Map<number, Promise<readonly PostingTerm[]>>();
   private opened?: Promise<void>;
-  private readonly pageCache: ByteCache<Uint8Array>;
-  private readonly chunkCache: ByteCache<Uint32Array>;
-  private readonly idCache: ByteCache<PostingObjectIdPage>;
+  private readonly pageCache: ByteCache<PostingCachedPage>;
+  private readonly chunkCache: ByteCache<PostingChunkValues>;
+  private readonly idCache: ByteCache<PostingObjectIdBlock>;
+  private readonly cacheLimit: number;
+  private readonly decodedCacheBudget?: CacheBudget;
   private matchedTermLimitError: Error | undefined;
   private readonly pendingPages = new Map<string, Promise<Uint8Array>>();
-  private readonly pendingChunks = new Map<string, Promise<Uint32Array>>();
+  private readonly pendingChunks = new Map<string, Promise<PostingChunkValues>>();
   readonly counters = {
     storeReads: 0,
     pagesRead: 0,
@@ -472,10 +765,16 @@ export class PostingReader {
     ];
     if (budgets.some((value) => !Number.isSafeInteger(value) || value < 0))
       throw new Error('POSTING_CACHE_LIMIT_INVALID');
+    this.cacheLimit = budgets[0]! + budgets[1]! + budgets[2]! + lexiconLimit;
+    const shared = options.pageCacheBytes === undefined &&
+      options.chunkCacheBytes === undefined && options.idCacheBytes === undefined &&
+      options.maxLexiconBytes === undefined
+      ? new CacheBudget(lexiconLimit + budgets[1]!) : undefined;
+    this.decodedCacheBudget = shared;
     this.pageCache = new ByteCache(budgets[0]!);
-    this.chunkCache = new ByteCache(budgets[1]!);
+    this.chunkCache = new ByteCache(shared?.limit ?? budgets[1]!, shared);
     this.idCache = new ByteCache(budgets[2]!);
-    this.lexiconCache = new ByteCache(lexiconLimit);
+    this.lexiconCache = new ByteCache(shared?.limit ?? lexiconLimit, shared);
   }
   /** Counters make cold loads and repeated Base64 decoding visible in benchmarks. */
   cacheUsage(): { pages: number; chunks: number; ids: number; directory: number; lexicon: number; limit: number } {
@@ -485,8 +784,7 @@ export class PostingReader {
       ids: this.idCache.bytes,
       directory: this.counters.directoryEstimatedBytes,
       lexicon: this.lexiconCache.bytes,
-      limit: this.pageCache.limit + this.chunkCache.limit + this.idCache.limit +
-        this.lexiconCache.limit + this.counters.directoryEstimatedBytes,
+      limit: this.cacheLimit,
     };
   }
   /** Load only the sparse block directory; terms and chunk descriptors remain paged. */
@@ -532,7 +830,10 @@ export class PostingReader {
     if (entries.length !== this.manifest.lexiconPages)
       throw new Error('POSTING_DIRECTORY_COUNT_MISMATCH');
     this.directory = entries;
-    this.lexiconCache = new ByteCache(maximum - retained);
+    const shared = this.decodedCacheBudget;
+    if (shared)
+      shared.resize(this.cacheLimit - this.pageCache.limit - this.idCache.limit - retained);
+    this.lexiconCache = new ByteCache(shared?.limit ?? maximum - retained, shared);
     this.counters.directoryBytes = decodedBytes;
     this.counters.directoryEstimatedBytes = retained;
     this.counters.lexiconEstimatedBytes = retained;
@@ -592,13 +893,13 @@ export class PostingReader {
     const page = Math.floor(index / this.manifest.descriptorsPerPage);
     const position = index % this.manifest.descriptorsPerPage;
     const cached = this.pageCache.get('descriptors:' + page);
-    if (cached) return descriptorAt(cached, position);
+    if (cached) return descriptorAt(postingCachedPageBytes(cached), position);
     return this.readPage('descriptors', page).then((bytes) => descriptorAt(bytes, position));
   }
   private async readPage(kind: PostingPageKind, page: number): Promise<Uint8Array> {
     const key = kind + ':' + page;
     const hit = this.pageCache.get(key);
-    if (hit) return hit;
+    if (hit) return postingCachedPageBytes(hit);
     const pending = this.pendingPages.get(key);
     if (pending) return pending;
     this.startPageReads(kind, [page]);
@@ -627,7 +928,7 @@ export class PostingReader {
       this.pendingPages.set(key, pending);
     }
   }
-  private readChunk(chunk: PostingChunk): Uint32Array | Promise<Uint32Array> {
+  private readChunk(chunk: PostingChunk): PostingChunkValues | Promise<PostingChunkValues> {
     const key = chunk[0] + ':' + chunk[1] + ':' + chunk[2];
     const hit = this.chunkCache.get(key);
     if (hit) return hit;
@@ -644,8 +945,9 @@ export class PostingReader {
         if (decoded[0] !== chunk[4] || decoded.at(-1) !== chunk[5])
           throw new Error('POSTING_CHUNK_BOUND_MISMATCH');
         this.counters.chunkDecodes++;
-        this.chunkCache.put(key, decoded, decoded.byteLength);
-        return decoded;
+        const values = compactPostingChunk(decoded, chunk);
+        this.chunkCache.put(key, values, values.byteLength);
+        return values;
       })().finally(() => this.pendingChunks.delete(key));
       this.pendingChunks.set(key, pending);
     }
@@ -669,9 +971,9 @@ export class PostingReader {
       const missing = batch.filter((number) => !this.lexiconCache.has(String(number)) &&
         !this.pageCache.has('lexicon:' + number) && !this.pendingPages.has('lexicon:' + number));
       if (missing.length) this.startPageReads('lexicon', missing);
-      await Promise.all(batch.map((number) => this.readLexiconPage(number)));
+      await completeReads(batch.map((number) => this.readLexiconPage(number)));
     }
-    return Promise.all(terms.map((term) => this.exact(term, includeCaseSensitiveKeys)));
+    return completeReads(terms.map((term) => this.exact(term, includeCaseSensitiveKeys)));
   }
   private async exact(term: string, includeCaseSensitiveKeys = false): Promise<PostingTerm[]> {
     const entries: PostingTerm[] = [];
@@ -722,12 +1024,13 @@ export class PostingReader {
       }
     }
   }
+  private listCursor(entry: PostingTerm, tick: () => void): ListCursor {
+    const firstDescriptor = entry.length === 2 ? 0 : entry[2];
+    return new ListCursor(entry, (index) => this.readDescriptor(firstDescriptor + index), (chunk) => this.readChunk(chunk), tick);
+  }
   private cursor(entries: readonly PostingTerm[], tick: () => void): Cursor {
     if (!entries.length) return emptyCursor();
-    const lists = entries.map((entry) => {
-      const firstDescriptor = entry.length === 2 ? 0 : entry[2];
-      return new ListCursor(entry, (index) => this.readDescriptor(firstDescriptor + index), (chunk) => this.readChunk(chunk), tick);
-    });
+    const lists = entries.map((entry) => this.listCursor(entry, tick));
     return lists.length === 1 ? lists[0]! : new UnionCursor(lists, tick);
   }
   private intersection(
@@ -743,62 +1046,104 @@ export class PostingReader {
       groupsBySize.push({ entries, size });
     }
     groupsBySize.sort((a, b) => a.size - b.size);
+    if (groupsBySize.length > 1 && groupsBySize.every(({ entries }) => entries.length === 1)) {
+      const cursors = groupsBySize.map(({ entries }) => this.listCursor(entries[0]!, tick));
+      return new LocalMembershipIntersectionCursor(cursors, tick);
+    }
     return new IntersectionCursor(
       groupsBySize.map(({ entries }) => this.cursor(entries, tick)),
       tick
     );
   }
+  private cachedObjectId(ordinal: number): string | undefined {
+    const block = this.idCache.get(Math.floor(ordinal / postingObjectIdBlockSize));
+    return block && cachedPostingObjectId(block, ordinal % postingObjectIdBlockSize);
+  }
+
+  private rememberObjectId(ordinal: number, id: string): void {
+    const key = Math.floor(ordinal / postingObjectIdBlockSize);
+    const previous = this.idCache.get(key);
+    const block = cachePostingObjectId(previous, ordinal % postingObjectIdBlockSize, id, this.idCache.limit);
+    if (block && block !== previous) this.idCache.put(key, block, postingObjectIdBlockBytes(block));
+  }
+
   private async objectIds(ordinals: readonly number[]): Promise<string[]> {
-    const pages = new Map<number, PostingObjectIdPage | undefined>();
-    let missing: number[] | undefined;
-    for (const ordinal of ordinals) {
-      const number = Math.floor(ordinal / this.manifest.idsPerPage);
-      if (pages.has(number)) continue;
-      const ids = this.idCache.get(String(number));
-      pages.set(number, ids);
-      if (!ids) (missing ??= []).push(number);
+    const result = new Array<string>(ordinals.length);
+    let pages: Map<number, PostingObjectIdPage | undefined> | undefined;
+    let blockNumber = -1;
+    let block: PostingObjectIdBlock | undefined;
+    for (let index = 0; index < ordinals.length; index++) {
+      const ordinal = ordinals[index]!;
+      const number = Math.floor(ordinal / postingObjectIdBlockSize);
+      if (number !== blockNumber) {
+        blockNumber = number;
+        block = this.idCache.get(number);
+      }
+      const id = block && cachedPostingObjectId(block, ordinal % postingObjectIdBlockSize);
+      if (id !== undefined) {
+        result[index] = id;
+        continue;
+      }
+      const pageNumber = Math.floor(ordinal / this.manifest.idsPerPage);
+      pages ??= new Map();
+      pages.set(pageNumber, undefined);
     }
-    if (missing?.length === 1) {
+    if (!pages) return result;
+    const missing = [...pages.keys()];
+    if (missing.length === 1) {
       const number = missing[0]!;
       pages.set(number, await this.readIdPage(number));
-    } else if (missing) {
-      // Bound each cold response even when a candidate batch touches many pages.
-      const idPageBatchSize = 4;
-      for (let start = 0; start < missing.length; start += idPageBatchSize) {
-        const batch = missing.slice(start, start + idPageBatchSize);
+    } else {
+      // Keep the existing four-page cold-response bound and only call-local decoded pages.
+      for (let start = 0; start < missing.length; start += 4) {
+        const batch = missing.slice(start, start + 4);
         this.prefetchIdPages(batch);
-        await Promise.all(batch.map(async (number) => {
-          pages.set(number, await this.readIdPage(number));
+        await completeReads(batch.map(async (number) => {
+          pages!.set(number, await this.readIdPage(number));
         }));
       }
     }
-    return ordinals.map((ordinal) => postingObjectIdAt(
-      pages.get(Math.floor(ordinal / this.manifest.idsPerPage))!,
-      ordinal % this.manifest.idsPerPage
-    ));
+    for (let index = 0; index < ordinals.length; index++) {
+      if (result[index] !== undefined) continue;
+      const ordinal = ordinals[index]!;
+      const id = postingObjectIdAt(
+        pages.get(Math.floor(ordinal / this.manifest.idsPerPage))!,
+        ordinal % this.manifest.idsPerPage
+      );
+      result[index] = id;
+      this.rememberObjectId(ordinal, id);
+    }
+    return result;
   }
 
   private prefetchIdPages(numbers: readonly number[]): void {
     const unread: number[] = [];
     for (const number of numbers) {
       const key = 'ids:' + number;
-      if (!this.idCache.has(String(number)) && !this.pageCache.has(key) && !this.pendingPages.has(key))
+      if (!this.pageCache.has(key) && !this.pendingPages.has(key))
         unread.push(number);
     }
     if (unread.length > 1) this.startPageReads('ids', unread);
   }
 
   private async readIdPage(number: number): Promise<PostingObjectIdPage> {
-    const key = String(number);
-    const hit = this.idCache.get(key);
-    if (hit) return hit;
-    const bytes = await this.readPage('ids', number);
+    const key = 'ids:' + number;
+    const cached = this.pageCache.get(key);
+    if (cached && !(cached instanceof Uint8Array)) return cached;
+    let bytes = cached;
+    if (!bytes) {
+      bytes = await this.readPage('ids', number);
+      // A concurrent consumer may already have parsed the shared raw response.
+      const shared = this.pageCache.get(key);
+      if (shared && !(shared instanceof Uint8Array)) return shared;
+    }
     const expected = Math.min(
       this.manifest.idsPerPage,
       this.manifest.documents - number * this.manifest.idsPerPage
     );
     const page = decodePostingObjectIds(bytes, expected);
-    this.idCache.put(key, page, 48 + bytes.byteLength + page.offsets.byteLength);
+    // The Buffer shares raw storage. Calibrated metadata includes views, objects and cache entry.
+    this.pageCache.put(key, page, bytes.byteLength + page.offsets.byteLength + 704);
     return page;
   }
   /** Enumerate immutable, ascending IDs in batches using only ID pages. */
@@ -810,7 +1155,7 @@ export class PostingReader {
       const end = Math.min(start + readSize, this.manifest.idPages);
       for (let page = start; page < end; page++) numbers.push(page);
       this.prefetchIdPages(numbers);
-      const batches = await Promise.all(numbers.map((number) => this.readIdPage(number)));
+      const batches = await completeReads(numbers.map((number) => this.readIdPage(number)));
       for (const page of batches) {
         const ids: string[] = [];
         for (let index = 0; index + 1 < page.offsets.length; index++)
@@ -962,8 +1307,7 @@ export class PostingReader {
   }
   private async rankPosition(tier: number, lastId: string): Promise<{ tier: number; ordinal: number }> {
     await this.open();
-    // Search the sorted ordinal->ID mapping. The continuation object may have
-    // been inserted after the frozen snapshot, so equality is not required.
+    // The boundary may not exist in this generation. Cache only examined midpoint IDs.
     const { idsPerPage } = this.manifest;
     let loadedPage = -1;
     let ids: PostingObjectIdPage | undefined;
@@ -971,12 +1315,18 @@ export class PostingReader {
       high = this.manifest.documents;
     while (low < high) {
       const mid = Math.floor((low + high) / 2);
-      const page = Math.floor(mid / idsPerPage);
-      if (page !== loadedPage) {
-        ids = await this.readIdPage(page);
-        loadedPage = page;
+      const key = mid;
+      let id = this.cachedObjectId(key);
+      if (id === undefined) {
+        const page = Math.floor(mid / idsPerPage);
+        if (page !== loadedPage) {
+          ids = await this.readIdPage(page);
+          loadedPage = page;
+        }
+        id = postingObjectIdAt(ids!, mid % idsPerPage);
+        this.rememberObjectId(key, id);
       }
-      if (postingObjectIdAt(ids!, mid % idsPerPage) <= lastId) low = mid + 1;
+      if (id <= lastId) low = mid + 1;
       else high = mid;
     }
     return { tier, ordinal: low - 1 };
@@ -1074,8 +1424,11 @@ export class PostingReader {
       }
       let nextOrdinal = after && tierNumber === after.tier ? after.ordinal + 1 : 0;
       let examinedInTier = 0, acceptedInTier = 0;
+      // A monotone cursor cannot revisit a denied ordinal in the final tier.
+      const retainRejected = tierNumber + 1 < tiers.length;
       while (result.results.length < resultLimit && cursor.peek() !== Infinity) {
         const candidates: number[] = [];
+        const missing: number[] = [];
         const remainingResults = resultLimit - result.results.length;
         const expectedCandidates = acceptedInTier
           ? Math.ceil(remainingResults * examinedInTier / acceptedInTier)
@@ -1088,11 +1441,17 @@ export class PostingReader {
         try {
           while (candidates.length < size) {
             let ordinal = cursor.peek();
-            if (ordinal < nextOrdinal) ordinal = await cursor.seek(nextOrdinal);
+            if (ordinal < nextOrdinal) {
+              const located = cursor.seek(nextOrdinal);
+              ordinal = located instanceof Promise ? await located : located;
+            }
             if (ordinal === Infinity) break;
             tick();
             nextOrdinal = ordinal + 1;
-            if (!accepted.has(ordinal) && sourceRows.get(ordinal) !== null) candidates.push(ordinal);
+            const source = sourceRows.get(ordinal);
+            if (source === null || (source !== undefined && accepted.has(ordinal))) continue;
+            candidates.push(ordinal);
+            if (source === undefined) missing.push(ordinal);
           }
         } catch (error) {
           if (!cursorLimitError || error !== cursorLimitError || !candidates.length) throw error;
@@ -1100,33 +1459,44 @@ export class PostingReader {
           deferredCursorLimit = cursorLimitError;
         }
         if (!candidates.length) break;
-        const missing = candidates.filter((ordinal) => !sourceRows.has(ordinal));
         if (missing.length) {
           result.sourceCandidates += missing.length;
           if (result.sourceCandidates > maxSourceCandidates)
             throw new Error('POSTING_SOURCE_CANDIDATE_LIMIT');
-          const ids = await this.objectIds(missing),
-            allowedIds = new Set(ids);
+          const ids = await this.objectIds(missing);
           result.sourceReads++;
           const fetched = await options.fetchSources(ids);
           result.sourceRows += fetched.length;
-          // Check requested IDs before calling the caller's extra eligibility filter.
-          const fetchedById = new Map<string, T>();
-          for (const object of fetched) {
-            const id = options.getId(object);
-            if (!allowedIds.has(id)) throw new Error('POSTING_SOURCE_OUTSIDE_REQUEST');
-            fetchedById.set(id, object);
-          }
-          const allowed = options.filterCandidates
-            ? new Set((await options.filterCandidates(fetched)).map((object) => options.getId(object)))
-            : allowedIds;
-          for (const [index, ordinal] of missing.entries()) {
-            const id = ids[index]!;
-            const object = fetchedById.get(id);
-            if ((object !== undefined || fetchedById.has(id)) && allowed.has(id)) {
-              sourceRows.set(ordinal, { object: object as T });
-            } else {
-              sourceRows.set(ordinal, null);
+          if (!fetched.length) {
+            // Sparse eligibility often rejects a whole batch. Preserve the filter
+            // callback while avoiding maps and sets for rows that do not exist.
+            if (options.filterCandidates) await options.filterCandidates(fetched);
+            if (retainRejected) for (const ordinal of missing) sourceRows.set(ordinal, null);
+            if (missing.length === candidates.length) {
+              examinedInTier += candidates.length;
+              if (deferredCursorLimit) throw deferredCursorLimit;
+              continue;
+            }
+          } else {
+            const allowedIds = new Set(ids);
+            // Check requested IDs before calling the caller's extra eligibility filter.
+            const fetchedById = new Map<string, T>();
+            for (const object of fetched) {
+              const id = options.getId(object);
+              if (!allowedIds.has(id)) throw new Error('POSTING_SOURCE_OUTSIDE_REQUEST');
+              fetchedById.set(id, object);
+            }
+            const allowed = options.filterCandidates
+              ? new Set((await options.filterCandidates(fetched)).map((object) => options.getId(object)))
+              : allowedIds;
+            for (let index = 0; index < missing.length; index++) {
+              const id = ids[index]!, ordinal = missing[index]!;
+              const object = fetchedById.get(id);
+              if ((object !== undefined || fetchedById.has(id)) && allowed.has(id)) {
+                sourceRows.set(ordinal, { object: object as T });
+              } else if (retainRejected) {
+                sourceRows.set(ordinal, null);
+              }
             }
           }
         }
