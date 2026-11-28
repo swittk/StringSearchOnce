@@ -371,13 +371,14 @@ class ListCursor implements Cursor {
     if (!this.retainCurrent || chunk !== this.currentHeader) return this.load(chunk);
     if (this.residentIds) return this.residentIds;
     const loaded = this.load(chunk);
-    if (loaded instanceof Promise)
-      return loaded.then((ids) => {
-        if (this.currentHeader === chunk) this.setCurrentChunk(chunk, ids);
-        return ids;
-      });
+    if (loaded instanceof Promise) return this.retainPendingChunk(chunk, loaded);
     this.setCurrentChunk(chunk, loaded);
     return loaded;
+  }
+  private async retainPendingChunk(chunk: PostingChunk, pending: Promise<PostingChunkValues>): Promise<PostingChunkValues> {
+    const ids = await pending;
+    if (this.currentHeader === chunk) this.setCurrentChunk(chunk, ids);
+    return ids;
   }
   private setCurrentChunk(chunk: PostingChunk, ids: PostingChunkValues): void {
     this.residentIds = ids;
@@ -423,10 +424,13 @@ class ListCursor implements Cursor {
     if (chunk && lo + 1 < hi) {
       const next = this.header(lo + 1);
       return next instanceof Promise
-        ? next.then((value) => this.seekAfterNextHeader(target, lo + 1, hi, value))
+        ? this.seekPendingNextHeader(target, lo + 1, hi, next)
         : this.seekAfterNextHeader(target, lo + 1, hi, next);
     }
     return this.seekHeaders(target, chunk ? lo + 1 : lo, hi);
+  }
+  private async seekPendingNextHeader(target: number, index: number, end: number, pending: Promise<PostingChunk>): Promise<number> {
+    return this.seekAfterNextHeader(target, index, end, await pending);
   }
   private seekAfterNextHeader(target: number, index: number, end: number, chunk: PostingChunk): number | Promise<number> {
     if (chunk[5] < target) return this.seekHeaders(target, index + 1, end);
@@ -439,10 +443,7 @@ class ListCursor implements Cursor {
     while (lo < hi) {
       const mid = (lo + hi) >>> 1;
       const located = this.header(mid);
-      if (located instanceof Promise)
-        return located.then((header) => header[5] < target
-          ? this.seekHeaders(target, mid + 1, hi, winning)
-          : this.seekHeaders(target, lo, mid, header));
+      if (located instanceof Promise) return this.seekPendingHeader(target, lo, hi, winning, located);
       if (located[5] < target) lo = mid + 1;
       else {
         hi = mid;
@@ -454,12 +455,24 @@ class ListCursor implements Cursor {
     this.currentHeader = winning!;
     return this.seekCurrentChunk(target, winning!);
   }
+  private async seekPendingHeader(
+    target: number, lo: number, hi: number, winning: PostingChunk | undefined, pending: Promise<PostingChunk>
+  ): Promise<number> {
+    const header = await pending;
+    const mid = (lo + hi) >>> 1;
+    return header[5] < target
+      ? this.seekHeaders(target, mid + 1, hi, winning)
+      : this.seekHeaders(target, lo, mid, header);
+  }
   private seekCurrentChunk(target: number, chunk: PostingChunk): number | Promise<number> {
     if (chunk[4] >= target) return (this.current = chunk[4]);
     const loaded = this.retainCurrent ? this.loadCurrentChunk(chunk) : this.load(chunk);
     return loaded instanceof Promise
-      ? loaded.then((ids) => this.seekLoadedChunk(target, chunk, ids))
+      ? this.seekPendingChunk(target, chunk, loaded)
       : this.seekLoadedChunk(target, chunk, loaded);
+  }
+  private async seekPendingChunk(target: number, chunk: PostingChunk, pending: Promise<PostingChunkValues>): Promise<number> {
+    return this.seekLoadedChunk(target, chunk, await pending);
   }
   private seekLoadedChunk(target: number, chunk: PostingChunk, ids: PostingChunkValues): number {
     const position = seekPostingChunk(ids, chunk, target, this.retainCurrent ? this.residentOffset : 0);
@@ -596,19 +609,27 @@ class LocalMembershipIntersectionCursor implements Cursor {
   }
   peek(): number { return this.current; }
   seek(target: number): number | Promise<number> {
+    const located = this.seekBuffered(target);
+    return typeof located === 'number' ? located : this.resumeSeek(target, located);
+  }
+  private seekBuffered(target: number): number | Promise<number | undefined> {
     if (this.current >= target) return this.current;
     while (this.position < this.values.length) {
       const candidate = this.values[this.position++]!;
       if (candidate < target) continue;
       this.tick();
       const located = this.probeCandidate(candidate, 0);
-      if (located instanceof Promise) return this.resumeSeek(target, located);
       if (located !== undefined) return located;
     }
-    return this.resumeSeek(target, this.prepareWindow(target));
+    return this.prepareWindow(target);
   }
-  private resumeSeek(target: number, pending: Promise<number | undefined>): Promise<number> {
-    return pending.then((value) => value === undefined ? this.seek(target) : value);
+  private async resumeSeek(target: number, pending: Promise<number | undefined>): Promise<number> {
+    let value = await pending;
+    while (value === undefined) {
+      const located = this.seekBuffered(target);
+      value = typeof located === 'number' ? located : await located;
+    }
+    return value;
   }
   /** Buffered candidates need no promise unless a probe actually reads another page. */
   private probeCandidate(candidate: number, from: number): number | undefined | Promise<number | undefined> {
@@ -663,6 +684,12 @@ class LocalMembershipIntersectionCursor implements Cursor {
           return known === Infinity ? this.exhaust() : (this.current = known);
         }
       }
+      // Each current peer position is a lower bound on any remaining match.
+      for (let index = 1; index < this.cursors.length; index++) {
+        const current = this.cursors[index]!.peek();
+        if (current === Infinity) return this.exhaust();
+        if (current > lower) lower = current;
+      }
       let window = await this.cursors[0]!.membershipWindow(lower);
       if (!window) return this.exhaust();
       let values = window.values;
@@ -710,7 +737,7 @@ export class PostingReader {
   private readonly decodedCacheBudget?: CacheBudget;
   private matchedTermLimitError: Error | undefined;
   private readonly pendingPages = new Map<string, Promise<Uint8Array>>();
-  private readonly pendingChunks = new Map<string, Promise<PostingChunkValues>>();
+  private readonly pendingChunks = new Map<number, Promise<PostingChunkValues>>();
   readonly counters = {
     storeReads: 0,
     pagesRead: 0,
@@ -894,7 +921,10 @@ export class PostingReader {
     const position = index % this.manifest.descriptorsPerPage;
     const cached = this.pageCache.get('descriptors:' + page);
     if (cached) return descriptorAt(postingCachedPageBytes(cached), position);
-    return this.readPage('descriptors', page).then((bytes) => descriptorAt(bytes, position));
+    return this.readDescriptorPage(page, position);
+  }
+  private async readDescriptorPage(page: number, position: number): Promise<PostingChunk> {
+    return descriptorAt(await this.readPage('descriptors', page), position);
   }
   private async readPage(kind: PostingPageKind, page: number): Promise<Uint8Array> {
     const key = kind + ':' + page;
@@ -929,29 +959,36 @@ export class PostingReader {
     }
   }
   private readChunk(chunk: PostingChunk): PostingChunkValues | Promise<PostingChunkValues> {
-    const key = chunk[0] + ':' + chunk[1] + ':' + chunk[2];
+    // Native bounds: <1M pages, <128 KiB offset and at most 4096 five-byte IDs.
+    // The complete page/offset/length identity fits exactly below 2^52.
+    const key = (chunk[0] * 131072 + chunk[1]) * 32768 + chunk[2];
     const hit = this.chunkCache.get(key);
     if (hit) return hit;
     let pending = this.pendingChunks.get(key);
     if (!pending) {
-      pending = (async () => {
-        const page = await this.readPage('postings', chunk[0]);
-        if (chunk[1] + chunk[2] > page.byteLength) throw new Error('POSTING_CHUNK_OUTSIDE_PAGE');
-        const decoded = decodePostingIds(
-          page.subarray(chunk[1], chunk[1] + chunk[2]),
-          chunk[3],
-          this.manifest.documents
-        );
-        if (decoded[0] !== chunk[4] || decoded.at(-1) !== chunk[5])
-          throw new Error('POSTING_CHUNK_BOUND_MISMATCH');
-        this.counters.chunkDecodes++;
-        const values = compactPostingChunk(decoded, chunk);
-        this.chunkCache.put(key, values, values.byteLength);
-        return values;
-      })().finally(() => this.pendingChunks.delete(key));
+      pending = this.loadChunk(chunk, key);
       this.pendingChunks.set(key, pending);
     }
     return pending;
+  }
+  private async loadChunk(chunk: PostingChunk, key: number): Promise<PostingChunkValues> {
+    try {
+      const page = await this.readPage('postings', chunk[0]);
+      if (chunk[1] + chunk[2] > page.byteLength) throw new Error('POSTING_CHUNK_OUTSIDE_PAGE');
+      const decoded = decodePostingIds(
+        page.subarray(chunk[1], chunk[1] + chunk[2]),
+        chunk[3],
+        this.manifest.documents
+      );
+      if (decoded[0] !== chunk[4] || decoded.at(-1) !== chunk[5])
+        throw new Error('POSTING_CHUNK_BOUND_MISMATCH');
+      this.counters.chunkDecodes++;
+      const values = compactPostingChunk(decoded, chunk);
+      this.chunkCache.put(key, values, values.byteLength);
+      return values;
+    } finally {
+      this.pendingChunks.delete(key);
+    }
   }
   private termLowerBound(entries: readonly PostingTerm[], term: string): number {
     let lo = 0, hi = entries.length;

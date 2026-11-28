@@ -93,3 +93,32 @@ test('wide sparse chunks preserve full ordinals across descriptor transitions', 
   });
   assert.deepEqual(suffix.results.map(hit => hit.object.id), expected.filter(id => id > idFor(65566)));
 });
+
+
+test('known peer positions avoid reading a disjoint anchor posting list', async () => {
+  const rows = Array.from({ length: 5 }, (_, ordinal) => ({
+    id: idFor(ordinal), names: ordinal < 2 ? [green] : [blue],
+  }));
+  const built = buildPostingGeneration(rows, {
+    generation: 'disjoint-local-anchor', kinds: ['title', 'alias'],
+  });
+  const byId = new Map(rows.map(row => [row.id, row]));
+  let postingPages = 0, sourceCalls = 0;
+  const reader = new PostingReader(built.manifest, {
+    async readPages(generation, kind, numbers) {
+      assert.equal(generation, built.manifest.generation);
+      if (kind === 'postings') postingPages += numbers.length;
+      return new Map(numbers.map(number => [number, built.pages.get(kind)[number]]));
+    },
+  });
+  const result = await reader.search({
+    text: 'ree lue', limit: 5,
+    fetchSources: async ids => { sourceCalls++; return ids.map(id => byId.get(id)); },
+    getId: row => row.id, getNames: row => row.names,
+  });
+  assert.deepEqual(result.results, []);
+  assert.equal(result.sourceCandidates, 0);
+  assert.equal(sourceCalls, 0);
+  assert.equal(postingPages, 0);
+  assert.equal(reader.counters.chunkDecodes, 0);
+});

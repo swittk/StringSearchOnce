@@ -45,8 +45,11 @@ export function cachePostingObjectId(
   if (entries === count) entries *= 2;
   let bytes = previous?.bytes.byteLength ?? 64;
   while (bytes < used + 1 + id.length) bytes *= 2;
-  const charge = blockMetadataBytes + entries * 6 + bytes;
-  if (charge > limit) return previous;
+  bytes = Math.min(bytes, limit - blockMetadataBytes - entries * 6);
+  if (bytes < used + 1 + id.length) {
+    // Replace a saturated range so later requested IDs can become resident.
+    return previous ? cachePostingObjectId(undefined, ordinal, id, limit) : undefined;
+  }
 
   let block = previous;
   if (!block || entries !== block.ordinals.length || bytes !== block.bytes.byteLength) {

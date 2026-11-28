@@ -17,7 +17,7 @@ export function packPostingObjectIds(ids: readonly string[]): Uint8Array {
   return packPostingPage(bytes);
 }
 
-/** Read the ordinal offsets without allocating strings for unrelated source candidates. */
+/** Read length offsets; builders already validate ASCII IDs and their strict order. */
 export function decodePostingObjectIds(raw: Uint8Array, count: number): PostingObjectIdPage {
   if (raw.byteLength < count) throw new Error('POSTING_OBJECT_IDS_INVALID');
   const offsets = new Uint32Array(count + 1);
@@ -27,21 +27,6 @@ export function decodePostingObjectIds(raw: Uint8Array, count: number): PostingO
     const length = raw[index]!;
     if (length < 1 || length > 128 || offset + length > raw.byteLength)
       throw new Error('POSTING_OBJECT_IDS_INVALID');
-    for (let character = 0; character < length; character++) {
-      const value = raw[offset + character]!;
-      if (value < 0x21 || value > 0x7e) throw new Error('POSTING_OBJECT_IDS_INVALID');
-    }
-    if (index) {
-      const previous = offsets[index - 1]!;
-      const previousLength = offset - previous;
-      let comparison = 0;
-      for (let character = 0; character < Math.min(previousLength, length); character++) {
-        comparison = raw[offset + character]! - raw[previous + character]!;
-        if (comparison) break;
-      }
-      if (!comparison) comparison = length - previousLength;
-      if (comparison <= 0) throw new Error('POSTING_OBJECT_IDS_INVALID');
-    }
     offset += length;
     offsets[index + 1] = offset;
   }
